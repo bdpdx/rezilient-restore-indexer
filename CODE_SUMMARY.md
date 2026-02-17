@@ -11,6 +11,8 @@ Entrypoints:
 - `src/freshness.ts`: strict fail-closed freshness gate evaluation.
 - `src/backfill.ts`: bootstrap and gap-repair orchestration with lag guardrails.
 - `src/store.ts`: in-memory restore index state store used by tests/dev.
+- `doc/runbooks.md`: RS-15 operator runbooks for lag, replay/generation, and
+  freshness fail-closed incidents.
 
 Tests:
 - `src/watermark-invariants.test.ts`

@@ -9,6 +9,7 @@ Current stage behavior:
 - Reports source coverage windows.
 - Evaluates strict fail-closed freshness states.
 - Runs bootstrap/gap-repair backfill controllers with lag guardrails.
+- Includes RS-15 incident runbooks at `doc/runbooks.md`.
 
 Run local tests:
 ```bash
