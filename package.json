@@ -1,0 +1,22 @@
+{
+    "name": "rezilient-restore-indexer",
+    "version": "0.0.1",
+    "private": true,
+    "license": "UNLICENSED",
+    "type": "commonjs",
+    "main": "dist/index.js",
+    "scripts": {
+        "build": "tsc -p tsconfig.json",
+        "start": "node dist/index.js",
+        "start:dev": "ts-node src/index.ts",
+        "test": "npm run build && node --test dist/watermark-invariants.test.js dist/generation-replay.integration.test.js dist/failure-modes.test.js dist/worker.integration.test.js"
+    },
+    "dependencies": {
+        "@rezilient/types": "file:../rezilient-types"
+    },
+    "devDependencies": {
+        "@types/node": "^24.7.2",
+        "ts-node": "^10.9.2",
+        "typescript": "^5.9.3"
+    }
+}
