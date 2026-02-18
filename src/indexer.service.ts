@@ -22,6 +22,7 @@ import type {
     PartitionWatermarkState,
     ProcessBatchResult,
     SourceCoverageState,
+    SourceProgressState,
 } from './types';
 
 export class WatermarkInvariantError extends Error {
@@ -66,12 +67,69 @@ export type SourceCoverageWindow = {
     tenant_id: string;
 };
 
+export type SourceProgressWindow = {
+    contract_version: string;
+    cursor: string | null;
+    instance_id: string;
+    last_batch_size: number;
+    last_indexed_event_time: string | null;
+    last_indexed_offset: number | null;
+    last_lag_seconds: number | null;
+    processed_count: number;
+    source: string;
+    tenant_id: string;
+    updated_at: string;
+};
+
+export type SourceProgressUpdateInput = {
+    cursor: string | null;
+    instanceId: string;
+    lastBatchSize: number;
+    lastIndexedEventTime: string | null;
+    lastIndexedOffset: number | null;
+    lastLagSeconds: number | null;
+    measuredAt: string;
+    processedDelta: number;
+    source: string;
+    tenantId: string;
+};
+
 function maxIso(left: string, right: string): string {
     return left >= right ? left : right;
 }
 
 function minIso(left: string, right: string): string {
     return left <= right ? left : right;
+}
+
+function maxNullableIso(
+    left: string | null,
+    right: string | null,
+): string | null {
+    if (left === null) {
+        return right;
+    }
+
+    if (right === null) {
+        return left;
+    }
+
+    return maxIso(left, right);
+}
+
+function maxNullableNumber(
+    left: number | null,
+    right: number | null,
+): number | null {
+    if (left === null) {
+        return right;
+    }
+
+    if (right === null) {
+        return left;
+    }
+
+    return Math.max(left, right);
 }
 
 function nowIso(): string {
@@ -328,6 +386,58 @@ export class RestoreIndexerService {
 
         return buildSourceCoverageWindow(coverage);
     }
+
+    async getSourceProgress(
+        tenantId: string,
+        instanceId: string,
+        source: string,
+    ): Promise<SourceProgressWindow | null> {
+        const progress = await this.store.getSourceProgress(
+            tenantId,
+            instanceId,
+            source,
+        );
+
+        if (progress === null) {
+            return null;
+        }
+
+        return buildSourceProgressWindow(progress);
+    }
+
+    async recordSourceProgress(
+        input: SourceProgressUpdateInput,
+    ): Promise<SourceProgressWindow> {
+        const measuredAt = isoDateTimeWithMillis.parse(input.measuredAt);
+        const current = await this.store.getSourceProgress(
+            input.tenantId,
+            input.instanceId,
+            input.source,
+        );
+        const nextState: SourceProgressState = {
+            cursor: input.cursor,
+            instanceId: input.instanceId,
+            lastBatchSize: input.lastBatchSize,
+            lastIndexedEventTime: maxNullableIso(
+                current?.lastIndexedEventTime ?? null,
+                input.lastIndexedEventTime,
+            ),
+            lastIndexedOffset: maxNullableNumber(
+                current?.lastIndexedOffset ?? null,
+                input.lastIndexedOffset,
+            ),
+            lastLagSeconds: input.lastLagSeconds,
+            processedCount: (current?.processedCount ?? 0)
+                + Math.max(0, input.processedDelta),
+            source: input.source,
+            tenantId: input.tenantId,
+            updatedAt: measuredAt,
+        };
+
+        await this.store.putSourceProgress(nextState);
+
+        return buildSourceProgressWindow(nextState);
+    }
 }
 
 function buildSourceCoverageWindow(
@@ -343,6 +453,24 @@ function buildSourceCoverageWindow(
         measured_at: coverage.measuredAt,
         source: coverage.source,
         tenant_id: coverage.tenantId,
+    };
+}
+
+function buildSourceProgressWindow(
+    progress: SourceProgressState,
+): SourceProgressWindow {
+    return {
+        contract_version: RESTORE_CONTRACT_VERSION,
+        cursor: progress.cursor,
+        instance_id: progress.instanceId,
+        last_batch_size: progress.lastBatchSize,
+        last_indexed_event_time: progress.lastIndexedEventTime,
+        last_indexed_offset: progress.lastIndexedOffset,
+        last_lag_seconds: progress.lastLagSeconds,
+        processed_count: progress.processedCount,
+        source: progress.source,
+        tenant_id: progress.tenantId,
+        updated_at: progress.updatedAt,
     };
 }
 

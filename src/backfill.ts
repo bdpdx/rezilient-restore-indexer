@@ -34,6 +34,8 @@ function cloneState(state: BackfillRunState): BackfillRunState {
 }
 
 export class BackfillController {
+    private initialized = false;
+
     private readonly timeProvider: () => string;
 
     private state: BackfillRunState;
@@ -67,6 +69,8 @@ export class BackfillController {
     }
 
     async pauseManual(): Promise<BackfillRunState> {
+        await this.ensureInitialized();
+
         this.state = {
             ...this.state,
             reasonCode: 'paused_manual',
@@ -79,6 +83,8 @@ export class BackfillController {
     }
 
     async resume(): Promise<BackfillRunState> {
+        await this.ensureInitialized();
+
         if (this.state.status === 'completed') {
             return this.getState();
         }
@@ -95,6 +101,8 @@ export class BackfillController {
     }
 
     async tick(): Promise<BackfillRunState> {
+        await this.ensureInitialized();
+
         if (
             this.state.status === 'paused'
             || this.state.status === 'completed'
@@ -143,6 +151,22 @@ export class BackfillController {
         await this.store.upsertBackfillRun(this.state);
 
         return this.getState();
+    }
+
+    private async ensureInitialized(): Promise<void> {
+        if (this.initialized) {
+            return;
+        }
+
+        const persisted = await this.store.getBackfillRun(this.state.runId);
+
+        if (persisted && persisted.mode === this.mode) {
+            this.state = cloneState(persisted);
+        } else {
+            await this.store.upsertBackfillRun(this.state);
+        }
+
+        this.initialized = true;
     }
 }
 

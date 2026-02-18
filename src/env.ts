@@ -4,6 +4,8 @@ export type RestoreIndexerEnv = {
     batchSize: number;
     defaultTenant: string;
     freshnessTimeoutSeconds: number;
+    pollIntervalMs: number;
+    stateDbPath: string;
     staleAfterSeconds: number;
 };
 
@@ -37,6 +39,16 @@ export function parseIndexerEnv(
         );
     }
 
+    const stateDbPath = String(
+        env.REZ_RESTORE_INDEXER_STATE_DB_PATH || '',
+    ).trim();
+
+    if (!stateDbPath) {
+        throw new Error(
+            'REZ_RESTORE_INDEXER_STATE_DB_PATH is required',
+        );
+    }
+
     return {
         backfillBatchSize: parsePositiveInt(
             env.REZ_RESTORE_INDEXER_BACKFILL_BATCH_SIZE,
@@ -55,6 +67,11 @@ export function parseIndexerEnv(
             env.REZ_RESTORE_INDEXER_FRESHNESS_TIMEOUT_SECONDS,
             60,
         ),
+        pollIntervalMs: parsePositiveInt(
+            env.REZ_RESTORE_INDEXER_POLL_INTERVAL_MS,
+            1000,
+        ),
+        stateDbPath,
         staleAfterSeconds: parsePositiveInt(
             env.REZ_RESTORE_INDEXER_STALE_AFTER_SECONDS,
             120,

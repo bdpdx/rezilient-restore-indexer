@@ -4,10 +4,12 @@
 - `types.ts`: indexer input/output model types.
 - `env.ts`: environment parsing helpers.
 - `metadata.ts`: metadata allowlist validation and normalization.
-- `store.ts`: sidecar persistence interface and in-memory implementation.
+- `store.ts`: sidecar persistence interface plus in-memory/SQLite durable
+  implementations.
 - `freshness.ts`: freshness/executability state evaluation.
 - `indexer.service.ts`: indexing core with generation-bound watermark logic.
-- `worker.ts`: source polling read/process/write loop.
+- `worker.ts`: cursor-aware source polling loop with continuous runtime
+  controls and source progress checkpointing.
 - `backfill.ts`: bootstrap and gap-repair controller.
 - `index.ts`: local bootstrap.
 - `test-helpers.ts`: deterministic fixtures.
@@ -15,3 +17,7 @@
 - `generation-replay.integration.test.ts`: replay/rewind generation tests.
 - `worker.integration.test.ts`: sidecar worker loop tests.
 - `failure-modes.test.ts`: stale gate timeout and backfill starvation tests.
+- `durability.integration.test.ts`: restart-survival tests for watermark,
+  coverage, backfill state, and source progress checkpoints.
+- `continuous-runtime.integration.test.ts`: steady-state and lag/replay
+  continuous loop processing tests.

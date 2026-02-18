@@ -4,22 +4,159 @@ import type {
     ProcessBatchResult,
 } from './types';
 
+export type ArtifactBatch = {
+    items: IndexArtifactInput[];
+    nextCursor: string | null;
+    realtimeLagSeconds: number | null;
+};
+
 export interface ArtifactBatchSource {
-    readBatch(limit: number): Promise<IndexArtifactInput[]>;
+    readBatch(input: {
+        cursor: string | null;
+        limit: number;
+    }): Promise<ArtifactBatch>;
 }
+
+export type SourceProgressScope = {
+    instanceId: string;
+    source: string;
+    tenantId: string;
+};
 
 export type WorkerRunSummary = ProcessBatchResult & {
     batchSize: number;
+    cursor: string | null;
+    realtimeLagSeconds: number | null;
 };
 
+export type WorkerLoopSummary = {
+    cycles: number;
+    emptyBatches: number;
+    existing: number;
+    failures: number;
+    inserted: number;
+};
+
+export type WorkerContinuousOptions = {
+    maxCycles?: number;
+};
+
+export type RestoreIndexerWorkerOptions = {
+    pollIntervalMs?: number;
+    sleep?: (ms: number) => Promise<void>;
+    sourceProgressScope?: SourceProgressScope;
+    timeProvider?: () => string;
+};
+
+const DEFAULT_POLL_INTERVAL_MS = 1000;
+
+function nowIso(): string {
+    return new Date().toISOString();
+}
+
+function sleepMs(
+    ms: number,
+): Promise<void> {
+    return new Promise((resolve) => {
+        setTimeout(resolve, ms);
+    });
+}
+
+function maxIso(
+    left: string,
+    right: string,
+): string {
+    return left >= right ? left : right;
+}
+
+function readOffset(item: IndexArtifactInput): number | null {
+    const metadataOffset = item.metadata.offset;
+
+    if (
+        typeof metadataOffset === 'number'
+        && Number.isInteger(metadataOffset)
+    ) {
+        return metadataOffset;
+    }
+
+    if (typeof metadataOffset === 'string' && /^\d+$/.test(metadataOffset)) {
+        return Number.parseInt(metadataOffset, 10);
+    }
+
+    if (typeof item.manifest.offset === 'string' && /^\d+$/.test(item.manifest.offset)) {
+        return Number.parseInt(item.manifest.offset, 10);
+    }
+
+    return null;
+}
+
+function latestEventTime(
+    items: IndexArtifactInput[],
+): string | null {
+    let latest: string | null = null;
+
+    for (const item of items) {
+        const eventTime = item.manifest.event_time;
+
+        if (latest === null) {
+            latest = eventTime;
+            continue;
+        }
+
+        latest = maxIso(latest, eventTime);
+    }
+
+    return latest;
+}
+
+function latestOffset(
+    items: IndexArtifactInput[],
+): number | null {
+    let latest: number | null = null;
+
+    for (const item of items) {
+        const offset = readOffset(item);
+
+        if (offset === null) {
+            continue;
+        }
+
+        if (latest === null || offset > latest) {
+            latest = offset;
+        }
+    }
+
+    return latest;
+}
+
 export class RestoreIndexerWorker {
+    private cursor: string | null = null;
+
+    private cursorLoaded = false;
+
     private paused = false;
+
+    private stopRequested = false;
+
+    private readonly pollIntervalMs: number;
+
+    private readonly sleep: (ms: number) => Promise<void>;
+
+    private readonly sourceProgressScope?: SourceProgressScope;
+
+    private readonly timeProvider: () => string;
 
     constructor(
         private readonly source: ArtifactBatchSource,
         private readonly indexer: RestoreIndexerService,
         private readonly batchSize: number,
-    ) {}
+        options: RestoreIndexerWorkerOptions = {},
+    ) {
+        this.pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+        this.sleep = options.sleep ?? sleepMs;
+        this.sourceProgressScope = options.sourceProgressScope;
+        this.timeProvider = options.timeProvider ?? nowIso;
+    }
 
     pause(): void {
         this.paused = true;
@@ -29,30 +166,136 @@ export class RestoreIndexerWorker {
         this.paused = false;
     }
 
+    requestStop(): void {
+        this.stopRequested = true;
+    }
+
     async runOnce(): Promise<WorkerRunSummary> {
         if (this.paused) {
             return {
                 batchSize: 0,
+                cursor: this.cursor,
                 existing: 0,
                 failures: 0,
                 inserted: 0,
+                realtimeLagSeconds: null,
             };
         }
 
-        const batch = await this.source.readBatch(this.batchSize);
-        const result = await this.indexer.processBatch(batch);
+        await this.loadCursorIfNeeded();
+
+        const batch = await this.source.readBatch({
+            cursor: this.cursor,
+            limit: this.batchSize,
+        });
+        const result = await this.indexer.processBatch(batch.items);
+
+        this.cursor = batch.nextCursor;
+
+        await this.persistSourceProgress(batch, result);
 
         return {
             ...result,
-            batchSize: batch.length,
+            batchSize: batch.items.length,
+            cursor: batch.nextCursor,
+            realtimeLagSeconds: batch.realtimeLagSeconds,
         };
+    }
+
+    async runContinuously(
+        options: WorkerContinuousOptions = {},
+    ): Promise<WorkerLoopSummary> {
+        const summary: WorkerLoopSummary = {
+            cycles: 0,
+            emptyBatches: 0,
+            existing: 0,
+            failures: 0,
+            inserted: 0,
+        };
+
+        while (!this.stopRequested) {
+            const run = await this.runOnce();
+
+            summary.cycles += 1;
+            summary.inserted += run.inserted;
+            summary.existing += run.existing;
+            summary.failures += run.failures;
+
+            if (run.batchSize === 0) {
+                summary.emptyBatches += 1;
+            }
+
+            if (
+                options.maxCycles !== undefined
+                && summary.cycles >= options.maxCycles
+            ) {
+                break;
+            }
+
+            if (this.stopRequested) {
+                break;
+            }
+
+            if (run.batchSize === 0) {
+                await this.sleep(this.pollIntervalMs);
+            }
+        }
+
+        return summary;
+    }
+
+    private async loadCursorIfNeeded(): Promise<void> {
+        if (this.cursorLoaded) {
+            return;
+        }
+
+        this.cursorLoaded = true;
+
+        if (!this.sourceProgressScope) {
+            return;
+        }
+
+        const progress = await this.indexer.getSourceProgress(
+            this.sourceProgressScope.tenantId,
+            this.sourceProgressScope.instanceId,
+            this.sourceProgressScope.source,
+        );
+
+        if (progress) {
+            this.cursor = progress.cursor;
+        }
+    }
+
+    private async persistSourceProgress(
+        batch: ArtifactBatch,
+        result: ProcessBatchResult,
+    ): Promise<void> {
+        if (!this.sourceProgressScope) {
+            return;
+        }
+
+        await this.indexer.recordSourceProgress({
+            cursor: batch.nextCursor,
+            instanceId: this.sourceProgressScope.instanceId,
+            lastBatchSize: batch.items.length,
+            lastIndexedEventTime: latestEventTime(batch.items),
+            lastIndexedOffset: latestOffset(batch.items),
+            lastLagSeconds: batch.realtimeLagSeconds,
+            measuredAt: this.timeProvider(),
+            processedDelta: result.inserted + result.existing + result.failures,
+            source: this.sourceProgressScope.source,
+            tenantId: this.sourceProgressScope.tenantId,
+        });
     }
 }
 
 export class InMemoryArtifactBatchSource implements ArtifactBatchSource {
     private readonly queue: IndexArtifactInput[] = [];
 
-    constructor(initial: IndexArtifactInput[] = []) {
+    constructor(
+        initial: IndexArtifactInput[] = [],
+        private realtimeLagSeconds: number | null = null,
+    ) {
         this.queue.push(...initial);
     }
 
@@ -60,7 +303,34 @@ export class InMemoryArtifactBatchSource implements ArtifactBatchSource {
         this.queue.push(...items);
     }
 
-    async readBatch(limit: number): Promise<IndexArtifactInput[]> {
-        return this.queue.splice(0, limit);
+    setRealtimeLagSeconds(lagSeconds: number | null): void {
+        this.realtimeLagSeconds = lagSeconds;
+    }
+
+    async readBatch(input: {
+        cursor: string | null;
+        limit: number;
+    }): Promise<ArtifactBatch> {
+        let start = 0;
+
+        if (input.cursor !== null) {
+            const parsed = Number.parseInt(input.cursor, 10);
+
+            if (Number.isFinite(parsed) && parsed >= 0) {
+                start = parsed;
+            }
+        }
+
+        const boundedStart = Math.min(start, this.queue.length);
+        const boundedEnd = Math.min(
+            this.queue.length,
+            boundedStart + input.limit,
+        );
+
+        return {
+            items: this.queue.slice(boundedStart, boundedEnd),
+            nextCursor: String(boundedEnd),
+            realtimeLagSeconds: this.realtimeLagSeconds,
+        };
     }
 }

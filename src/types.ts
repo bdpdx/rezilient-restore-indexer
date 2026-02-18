@@ -103,6 +103,19 @@ export type SourceCoverageState = {
     tenantId: string;
 };
 
+export type SourceProgressState = {
+    cursor: string | null;
+    instanceId: string;
+    lastBatchSize: number;
+    lastIndexedEventTime: string | null;
+    lastIndexedOffset: number | null;
+    lastLagSeconds: number | null;
+    processedCount: number;
+    source: string;
+    tenantId: string;
+    updatedAt: string;
+};
+
 export type FreshnessEvaluation = {
     executability: RestoreWatermarkExecutability;
     freshness: RestoreWatermarkFreshness;
