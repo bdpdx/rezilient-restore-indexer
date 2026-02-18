@@ -173,3 +173,142 @@ async () => {
     assert.equal(resumedBackfillState.status, 'completed');
     assert.equal(resumedBackfillState.processedCount, 1);
 });
+
+test('restart preserves large offset watermark and source progress',
+async () => {
+    const dbPath = createTempDbPath('restart-large-offsets');
+    const scope = {
+        instanceId: 'sn-dev-01',
+        source: 'sn://acme-dev.service-now.com',
+        tenantId: 'tenant-acme',
+    };
+    const partitionScope = {
+        ...scope,
+        partition: 0,
+        topic: 'rez.cdc',
+    };
+    const secondLargeOffset = '9007199254740995';
+    const thirdLargeOffset = '9007199254740996';
+
+    const first = createFixture(dbPath);
+    const source = new InMemoryArtifactBatchSource([
+        buildTestInput({
+            eventId: 'evt-large-durable-1',
+            generationId: 'gen-large',
+            offset: '9007199254740994',
+        }),
+        buildTestInput({
+            eventId: 'evt-large-durable-2',
+            generationId: 'gen-large',
+            offset: secondLargeOffset,
+        }),
+    ], 5);
+    const worker = new RestoreIndexerWorker(
+        source,
+        first.indexer,
+        2,
+        {
+            pollIntervalMs: 1,
+            sourceProgressScope: scope,
+            timeProvider: () => '2026-02-18T10:10:00.000Z',
+        },
+    );
+
+    const firstRun = await worker.runOnce();
+
+    assert.equal(firstRun.inserted, 2);
+
+    const progressBeforeRestart = await first.indexer.getSourceProgress(
+        scope.tenantId,
+        scope.instanceId,
+        scope.source,
+    );
+    const watermarkBeforeRestart =
+        await first.indexer.getPartitionWatermarkStatus(
+            partitionScope,
+            {
+                now: '2026-02-18T10:11:00.000Z',
+            },
+        );
+
+    assert.equal(
+        progressBeforeRestart?.last_indexed_offset,
+        secondLargeOffset,
+    );
+    assert.equal(
+        watermarkBeforeRestart.watermark?.indexed_through_offset,
+        secondLargeOffset,
+    );
+
+    const restarted = createFixture(dbPath);
+    const progressAfterRestart = await restarted.indexer.getSourceProgress(
+        scope.tenantId,
+        scope.instanceId,
+        scope.source,
+    );
+    const watermarkAfterRestart =
+        await restarted.indexer.getPartitionWatermarkStatus(
+            partitionScope,
+            {
+                now: '2026-02-18T10:12:00.000Z',
+            },
+        );
+
+    assert.equal(
+        progressAfterRestart?.last_indexed_offset,
+        secondLargeOffset,
+    );
+    assert.equal(
+        watermarkAfterRestart.watermark?.indexed_through_offset,
+        secondLargeOffset,
+    );
+
+    const resumedWorker = new RestoreIndexerWorker(
+        new InMemoryArtifactBatchSource([
+            buildTestInput({
+                eventId: 'evt-large-durable-1',
+                generationId: 'gen-large',
+                offset: '9007199254740994',
+            }),
+            buildTestInput({
+                eventId: 'evt-large-durable-2',
+                generationId: 'gen-large',
+                offset: secondLargeOffset,
+            }),
+            buildTestInput({
+                eventId: 'evt-large-durable-3',
+                generationId: 'gen-large',
+                offset: thirdLargeOffset,
+            }),
+        ], 5),
+        restarted.indexer,
+        2,
+        {
+            pollIntervalMs: 1,
+            sourceProgressScope: scope,
+            timeProvider: () => '2026-02-18T10:13:00.000Z',
+        },
+    );
+    const resumedRun = await resumedWorker.runOnce();
+
+    assert.equal(resumedRun.inserted, 1);
+
+    const progressAfterResume = await restarted.indexer.getSourceProgress(
+        scope.tenantId,
+        scope.instanceId,
+        scope.source,
+    );
+    const watermarkAfterResume =
+        await restarted.indexer.getPartitionWatermarkStatus(
+            partitionScope,
+            {
+                now: '2026-02-18T10:14:00.000Z',
+            },
+        );
+
+    assert.equal(progressAfterResume?.last_indexed_offset, thirdLargeOffset);
+    assert.equal(
+        watermarkAfterResume.watermark?.indexed_through_offset,
+        thirdLargeOffset,
+    );
+});

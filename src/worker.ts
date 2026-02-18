@@ -1,3 +1,4 @@
+import { canonicalizeRestoreOffsetDecimalString } from '@rezilient/types';
 import type { RestoreIndexerService } from './indexer.service';
 import type {
     IndexArtifactInput,
@@ -69,25 +70,41 @@ function maxIso(
     return left >= right ? left : right;
 }
 
-function readOffset(item: IndexArtifactInput): number | null {
+function normalizeOffset(value: unknown): string | null {
+    if (typeof value !== 'string' && typeof value !== 'number') {
+        return null;
+    }
+
+    try {
+        return canonicalizeRestoreOffsetDecimalString(value);
+    } catch {
+        return null;
+    }
+}
+
+function compareOffsets(
+    left: string,
+    right: string,
+): number {
+    const leftValue = BigInt(left);
+    const rightValue = BigInt(right);
+
+    if (leftValue === rightValue) {
+        return 0;
+    }
+
+    return leftValue > rightValue ? 1 : -1;
+}
+
+function readOffset(item: IndexArtifactInput): string | null {
     const metadataOffset = item.metadata.offset;
+    const metadataCanonical = normalizeOffset(metadataOffset);
 
-    if (
-        typeof metadataOffset === 'number'
-        && Number.isInteger(metadataOffset)
-    ) {
-        return metadataOffset;
+    if (metadataCanonical !== null) {
+        return metadataCanonical;
     }
 
-    if (typeof metadataOffset === 'string' && /^\d+$/.test(metadataOffset)) {
-        return Number.parseInt(metadataOffset, 10);
-    }
-
-    if (typeof item.manifest.offset === 'string' && /^\d+$/.test(item.manifest.offset)) {
-        return Number.parseInt(item.manifest.offset, 10);
-    }
-
-    return null;
+    return normalizeOffset(item.manifest.offset);
 }
 
 function latestEventTime(
@@ -111,8 +128,8 @@ function latestEventTime(
 
 function latestOffset(
     items: IndexArtifactInput[],
-): number | null {
-    let latest: number | null = null;
+): string | null {
+    let latest: string | null = null;
 
     for (const item of items) {
         const offset = readOffset(item);
@@ -121,7 +138,7 @@ function latestOffset(
             continue;
         }
 
-        if (latest === null || offset > latest) {
+        if (latest === null || compareOffsets(offset, latest) > 0) {
             latest = offset;
         }
     }
@@ -152,7 +169,8 @@ export class RestoreIndexerWorker {
         private readonly batchSize: number,
         options: RestoreIndexerWorkerOptions = {},
     ) {
-        this.pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+        this.pollIntervalMs = options.pollIntervalMs
+            ?? DEFAULT_POLL_INTERVAL_MS;
         this.sleep = options.sleep ?? sleepMs;
         this.sourceProgressScope = options.sourceProgressScope;
         this.timeProvider = options.timeProvider ?? nowIso;

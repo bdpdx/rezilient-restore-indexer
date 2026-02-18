@@ -1,3 +1,4 @@
+import { canonicalizeRestoreOffsetDecimalString } from '@rezilient/types';
 import {
     RESTORE_CONTRACT_VERSION,
     RESTORE_METADATA_ALLOWLIST_VERSION,
@@ -15,7 +16,7 @@ export type InputOverrides = {
     ingestionMode?: 'realtime' | 'bootstrap' | 'gap_repair';
     instanceId?: string;
     metadata?: Record<string, unknown>;
-    offset?: number;
+    offset?: number | string;
     partition?: number;
     source?: string;
     table?: string;
@@ -30,7 +31,9 @@ export function buildTestManifest(
     const eventTime = overrides.eventTime || '2026-02-16T12:00:00.000Z';
     const topic = overrides.topic || 'rez.cdc';
     const partition = overrides.partition ?? 0;
-    const offset = String(overrides.offset ?? 1);
+    const offset = canonicalizeRestoreOffsetDecimalString(
+        overrides.offset ?? 1,
+    );
     const source = overrides.source || 'sn://acme-dev.service-now.com';
     const instanceId = overrides.instanceId || 'sn-dev-01';
     const table = overrides.table || 'x_app.ticket';
@@ -71,7 +74,7 @@ export function buildTestInput(
             event_id: manifest.event_id,
             event_type: manifest.event_type,
             instance_id: manifest.instance_id,
-            offset: Number.parseInt(manifest.offset || '0', 10),
+            offset: manifest.offset,
             operation: 'U',
             partition: manifest.partition,
             record_sys_id: 'abc123',

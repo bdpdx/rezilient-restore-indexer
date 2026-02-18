@@ -1,4 +1,5 @@
 import {
+    canonicalizeRestoreOffsetDecimalString,
     canonicalizeIsoDateTimeWithMillis,
     isoDateTimeWithMillis,
 } from '@rezilient/types';
@@ -76,7 +77,7 @@ export type SourceProgressWindow = {
     instance_id: string;
     last_batch_size: number;
     last_indexed_event_time: string | null;
-    last_indexed_offset: number | null;
+    last_indexed_offset: string | null;
     last_lag_seconds: number | null;
     processed_count: number;
     source: string;
@@ -89,7 +90,7 @@ export type SourceProgressUpdateInput = {
     instanceId: string;
     lastBatchSize: number;
     lastIndexedEventTime: string | null;
-    lastIndexedOffset: number | null;
+    lastIndexedOffset: string | null;
     lastLagSeconds: number | null;
     measuredAt: string;
     processedDelta: number;
@@ -120,19 +121,59 @@ function maxNullableIso(
     return maxIso(left, right);
 }
 
-function maxNullableNumber(
-    left: number | null,
-    right: number | null,
-): number | null {
+function canonicalizeOffset(
+    value: string | number,
+    fieldPath: string,
+): string {
+    try {
+        return canonicalizeRestoreOffsetDecimalString(value);
+    } catch {
+        throw new Error(`Invalid ${fieldPath} value: ${String(value)}`);
+    }
+}
+
+function compareOffsets(
+    left: string,
+    right: string,
+): number {
+    const leftCanonical = canonicalizeOffset(left, 'offset');
+    const rightCanonical = canonicalizeOffset(right, 'offset');
+    const leftValue = BigInt(leftCanonical);
+    const rightValue = BigInt(rightCanonical);
+
+    if (leftValue === rightValue) {
+        return 0;
+    }
+
+    return leftValue > rightValue ? 1 : -1;
+}
+
+function maxNullableOffset(
+    left: string | number | null,
+    right: string | number | null,
+): string | null {
+    const leftCanonical = left === null
+        ? null
+        : canonicalizeOffset(left, 'source progress lastIndexedOffset');
+    const rightCanonical = right === null
+        ? null
+        : canonicalizeOffset(right, 'source progress lastIndexedOffset');
+
     if (left === null) {
-        return right;
+        return rightCanonical;
     }
 
-    if (right === null) {
-        return left;
+    if (rightCanonical === null) {
+        return leftCanonical;
     }
 
-    return Math.max(left, right);
+    if (leftCanonical === null) {
+        return rightCanonical;
+    }
+
+    return compareOffsets(leftCanonical, rightCanonical) >= 0
+        ? leftCanonical
+        : rightCanonical;
 }
 
 function nowIso(): string {
@@ -156,6 +197,10 @@ function canonicalizeWatermarkTimestamps(
         ...state,
         coverageEnd: canonicalizeIsoDateTimeWithMillis(state.coverageEnd),
         coverageStart: canonicalizeIsoDateTimeWithMillis(state.coverageStart),
+        indexedThroughOffset: canonicalizeOffset(
+            state.indexedThroughOffset,
+            'partition watermark indexedThroughOffset',
+        ),
         indexedThroughTime: canonicalizeIsoDateTimeWithMillis(
             state.indexedThroughTime,
         ),
@@ -187,18 +232,23 @@ function buildEventRecord(
 
 function buildNextWatermark(
     current: PartitionWatermarkState | null,
-    nextOffset: number,
+    nextOffset: string,
     nextEventTime: string,
     partitionScope: PartitionScope,
     generationId: string,
     measuredAt: string,
 ): PartitionWatermarkState {
+    const nextOffsetCanonical = canonicalizeOffset(
+        nextOffset,
+        'normalized metadata offset',
+    );
+
     if (current === null) {
         return {
             coverageEnd: nextEventTime,
             coverageStart: nextEventTime,
             generationId,
-            indexedThroughOffset: nextOffset,
+            indexedThroughOffset: nextOffsetCanonical,
             indexedThroughTime: nextEventTime,
             instanceId: partitionScope.instanceId,
             measuredAt,
@@ -214,7 +264,7 @@ function buildNextWatermark(
             coverageEnd: nextEventTime,
             coverageStart: nextEventTime,
             generationId,
-            indexedThroughOffset: nextOffset,
+            indexedThroughOffset: nextOffsetCanonical,
             indexedThroughTime: nextEventTime,
             instanceId: partitionScope.instanceId,
             measuredAt,
@@ -225,21 +275,25 @@ function buildNextWatermark(
         };
     }
 
-    if (nextOffset < current.indexedThroughOffset) {
+    if (compareOffsets(nextOffsetCanonical, current.indexedThroughOffset) < 0) {
         throw new WatermarkInvariantError(
             `Offset rewind in generation ${generationId}: `
-            + `${nextOffset} < ${current.indexedThroughOffset}`,
+            + `${nextOffsetCanonical} < ${current.indexedThroughOffset}`,
         );
     }
+
+    const indexedThroughOffset = compareOffsets(
+        current.indexedThroughOffset,
+        nextOffsetCanonical,
+    ) >= 0
+        ? current.indexedThroughOffset
+        : nextOffsetCanonical;
 
     return {
         coverageEnd: maxIso(current.coverageEnd, nextEventTime),
         coverageStart: minIso(current.coverageStart, nextEventTime),
         generationId,
-        indexedThroughOffset: Math.max(
-            current.indexedThroughOffset,
-            nextOffset,
-        ),
+        indexedThroughOffset,
         indexedThroughTime: maxIso(
             current.indexedThroughTime,
             nextEventTime,
@@ -286,7 +340,9 @@ export class RestoreIndexerService {
             measuredAt,
         );
         const eventRecord = buildEventRecord(input, normalized, measuredAt);
-        const eventWriteState = await this.store.upsertIndexedEvent(eventRecord);
+        const eventWriteState = await this.store.upsertIndexedEvent(
+            eventRecord,
+        );
 
         if (eventWriteState === 'inserted') {
             await this.store.putPartitionWatermark(nextWatermark);
@@ -467,7 +523,7 @@ export class RestoreIndexerService {
                 currentLastIndexedEventTime,
                 inputLastIndexedEventTime,
             ),
-            lastIndexedOffset: maxNullableNumber(
+            lastIndexedOffset: maxNullableOffset(
                 current?.lastIndexedOffset ?? null,
                 input.lastIndexedOffset,
             ),
@@ -504,13 +560,20 @@ function buildSourceCoverageWindow(
 function buildSourceProgressWindow(
     progress: SourceProgressState,
 ): SourceProgressWindow {
+    const lastIndexedOffset = progress.lastIndexedOffset === null
+        ? null
+        : canonicalizeOffset(
+            progress.lastIndexedOffset,
+            'source progress lastIndexedOffset',
+        );
+
     return {
         contract_version: RESTORE_CONTRACT_VERSION,
         cursor: progress.cursor,
         instance_id: progress.instanceId,
         last_batch_size: progress.lastBatchSize,
         last_indexed_event_time: progress.lastIndexedEventTime,
-        last_indexed_offset: progress.lastIndexedOffset,
+        last_indexed_offset: lastIndexedOffset,
         last_lag_seconds: progress.lastLagSeconds,
         processed_count: progress.processedCount,
         source: progress.source,

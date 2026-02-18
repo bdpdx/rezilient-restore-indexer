@@ -83,7 +83,7 @@ export type PartitionWatermarkState = {
     coverageEnd: string;
     coverageStart: string;
     generationId: string;
-    indexedThroughOffset: number;
+    indexedThroughOffset: string;
     indexedThroughTime: string;
     instanceId: string;
     measuredAt: string;
@@ -108,7 +108,7 @@ export type SourceProgressState = {
     instanceId: string;
     lastBatchSize: number;
     lastIndexedEventTime: string | null;
-    lastIndexedOffset: number | null;
+    lastIndexedOffset: string | null;
     lastLagSeconds: number | null;
     processedCount: number;
     source: string;

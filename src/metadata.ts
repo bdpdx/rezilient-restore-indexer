@@ -14,7 +14,7 @@ import type {
 export type NormalizedMetadata = {
     eventTime: string;
     metadata: RrsOperationalMetadata;
-    offset: number;
+    offset: string;
     partitionScope: PartitionScope;
 };
 
@@ -61,23 +61,20 @@ function normalizeManifestOffset(
 
 function parseRuntimeOffset(
     offset: string,
-): number {
-    const parsed = Number.parseInt(offset, 10);
-
-    if (!Number.isSafeInteger(parsed) || parsed < 0) {
+): string {
+    try {
+        return canonicalizeRestoreOffsetDecimalString(offset);
+    } catch {
         throw new Error(
-            'Operational metadata offset exceeds safe integer runtime '
-            + `compatibility range: ${offset}`,
+            `Invalid operational metadata offset value: ${offset}`,
         );
     }
-
-    return parsed;
 }
 
 function ensureTopicPartitionOffset(
     metadata: RrsOperationalMetadata,
 ): {
-    offset: number;
+    offset: string;
     partition: number;
     topic: string;
 } {
