@@ -50,7 +50,7 @@ test('rejects offset rewind inside the same generation', async () => {
     });
 
     assert.equal(status.watermark?.generation_id, 'gen-a');
-    assert.equal(status.watermark?.indexed_through_offset, 10);
+    assert.equal(status.watermark?.indexed_through_offset, '10');
 });
 
 test('new generation accepts rewind and resets active coverage state', async () => {
@@ -81,7 +81,7 @@ test('new generation accepts rewind and resets active coverage state', async () 
     });
 
     assert.equal(status.watermark?.generation_id, 'gen-b');
-    assert.equal(status.watermark?.indexed_through_offset, 3);
+    assert.equal(status.watermark?.indexed_through_offset, '3');
 
     const coverage = await indexer.getSourceCoverageWindow(
         'tenant-acme',
@@ -103,6 +103,20 @@ test('rejects metadata outside rrs.metadata.allowlist.v1', async () => {
                 short_description: 'plaintext not allowed',
             },
         })),
+    );
+});
+
+test('rejects unsafe offset beyond runtime compatibility range', async () => {
+    const { indexer } = createIndexer();
+
+    await assert.rejects(
+        indexer.indexArtifact(buildTestInput({
+            eventId: 'evt-unsafe-offset',
+            metadata: {
+                offset: '9007199254740993',
+            },
+        })),
+        /Operational metadata offset exceeds safe integer runtime/,
     );
 });
 

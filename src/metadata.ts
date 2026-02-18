@@ -1,5 +1,6 @@
 import {
     canonicalizeIsoDateTimeWithMillis,
+    canonicalizeRestoreOffsetDecimalString,
     isoDateTimeWithMillis,
     RESTORE_METADATA_ALLOWLIST_VERSION,
     RrsMetadataEnvelope,
@@ -13,11 +14,11 @@ import type {
 export type NormalizedMetadata = {
     eventTime: string;
     metadata: RrsOperationalMetadata;
+    offset: number;
     partitionScope: PartitionScope;
 };
 
 const INTEGER_FIELDS = [
-    'offset',
     'partition',
     'schema_version',
     'size_bytes',
@@ -46,18 +47,31 @@ function toInteger(
 
 function normalizeManifestOffset(
     rawOffset: string | undefined,
-): number | undefined {
+): string | undefined {
     if (rawOffset === undefined) {
         return undefined;
     }
 
-    const offset = toInteger(rawOffset);
-
-    if (offset === null) {
+    try {
+        return canonicalizeRestoreOffsetDecimalString(rawOffset);
+    } catch {
         throw new Error(`Invalid manifest offset value: ${rawOffset}`);
     }
+}
 
-    return offset;
+function parseRuntimeOffset(
+    offset: string,
+): number {
+    const parsed = Number.parseInt(offset, 10);
+
+    if (!Number.isSafeInteger(parsed) || parsed < 0) {
+        throw new Error(
+            'Operational metadata offset exceeds safe integer runtime '
+            + `compatibility range: ${offset}`,
+        );
+    }
+
+    return parsed;
 }
 
 function ensureTopicPartitionOffset(
@@ -80,7 +94,7 @@ function ensureTopicPartitionOffset(
     }
 
     return {
-        offset: metadata.offset,
+        offset: parseRuntimeOffset(metadata.offset),
         partition: metadata.partition,
         topic: metadata.topic,
     };
@@ -177,7 +191,7 @@ export function normalizeOperationalMetadata(
         metadata: merged,
     });
     const metadata = parsed.metadata;
-    const { partition, topic } = ensureTopicPartitionOffset(metadata);
+    const { offset, partition, topic } = ensureTopicPartitionOffset(metadata);
 
     if (!metadata.instance_id) {
         throw new Error('Operational metadata is missing instance_id');
@@ -203,6 +217,7 @@ export function normalizeOperationalMetadata(
     return {
         eventTime,
         metadata,
+        offset,
         partitionScope: {
             instanceId: metadata.instance_id,
             partition,

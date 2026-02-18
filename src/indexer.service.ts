@@ -279,7 +279,7 @@ export class RestoreIndexerService {
             : canonicalizeWatermarkTimestamps(currentRaw);
         const nextWatermark = buildNextWatermark(
             current,
-            normalized.metadata.offset,
+            normalized.offset,
             normalized.eventTime,
             normalized.partitionScope,
             input.generationId,

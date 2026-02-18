@@ -133,7 +133,7 @@ async () => {
         now: '2026-02-18T11:06:00.000Z',
     });
 
-    assert.equal(watermark.watermark?.indexed_through_offset, 2);
+    assert.equal(watermark.watermark?.indexed_through_offset, '2');
 
     const progress = await fixture.indexer.getSourceProgress(
         scope.tenantId,
