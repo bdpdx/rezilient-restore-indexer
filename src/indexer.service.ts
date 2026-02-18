@@ -1,4 +1,7 @@
-import { isoDateTimeWithMillis } from '@rezilient/types';
+import {
+    canonicalizeIsoDateTimeWithMillis,
+    isoDateTimeWithMillis,
+} from '@rezilient/types';
 import {
     RESTORE_CONTRACT_VERSION,
     RESTORE_COVERAGE_WINDOW_VERSION,
@@ -136,6 +139,30 @@ function nowIso(): string {
     return new Date().toISOString();
 }
 
+function canonicalizeNullableIso(
+    value: string | null,
+): string | null {
+    if (value === null) {
+        return null;
+    }
+
+    return canonicalizeIsoDateTimeWithMillis(value);
+}
+
+function canonicalizeWatermarkTimestamps(
+    state: PartitionWatermarkState,
+): PartitionWatermarkState {
+    return {
+        ...state,
+        coverageEnd: canonicalizeIsoDateTimeWithMillis(state.coverageEnd),
+        coverageStart: canonicalizeIsoDateTimeWithMillis(state.coverageStart),
+        indexedThroughTime: canonicalizeIsoDateTimeWithMillis(
+            state.indexedThroughTime,
+        ),
+        measuredAt: canonicalizeIsoDateTimeWithMillis(state.measuredAt),
+    };
+}
+
 function buildEventRecord(
     input: IndexArtifactInput,
     normalized: ReturnType<typeof normalizeOperationalMetadata>,
@@ -235,8 +262,8 @@ export class RestoreIndexerService {
     async indexArtifact(
         input: IndexArtifactInput,
     ): Promise<IndexedArtifactResult> {
-        const measuredAt = isoDateTimeWithMillis.parse(
-            input.indexedAt || nowIso(),
+        const measuredAt = canonicalizeIsoDateTimeWithMillis(
+            isoDateTimeWithMillis.parse(input.indexedAt || nowIso()),
         );
         const normalized = normalizeOperationalMetadata(input);
 
@@ -244,9 +271,12 @@ export class RestoreIndexerService {
             throw new Error('Normalized metadata is missing offset');
         }
 
-        const current = await this.store.getPartitionWatermark(
+        const currentRaw = await this.store.getPartitionWatermark(
             normalized.partitionScope,
         );
+        const current = currentRaw === null
+            ? null
+            : canonicalizeWatermarkTimestamps(currentRaw);
         const nextWatermark = buildNextWatermark(
             current,
             normalized.metadata.offset,
@@ -319,8 +349,13 @@ export class RestoreIndexerService {
         scope: PartitionScope,
         gate: FreshnessGateInput,
     ): Promise<PartitionWatermarkStatus> {
-        const measuredAt = isoDateTimeWithMillis.parse(gate.now);
-        const watermark = await this.store.getPartitionWatermark(scope);
+        const measuredAt = canonicalizeIsoDateTimeWithMillis(
+            isoDateTimeWithMillis.parse(gate.now),
+        );
+        const watermarkRaw = await this.store.getPartitionWatermark(scope);
+        const watermark = watermarkRaw === null
+            ? null
+            : canonicalizeWatermarkTimestamps(watermarkRaw);
         const evaluation = evaluateFreshnessState(
             watermark,
             this.options.freshnessPolicy,
@@ -375,7 +410,9 @@ export class RestoreIndexerService {
     ): Promise<SourceCoverageWindow | null> {
         const coverage = await this.store.recomputeSourceCoverage({
             instanceId,
-            measuredAt: isoDateTimeWithMillis.parse(measuredAt),
+            measuredAt: canonicalizeIsoDateTimeWithMillis(
+                isoDateTimeWithMillis.parse(measuredAt),
+            ),
             source,
             tenantId,
         });
@@ -408,19 +445,27 @@ export class RestoreIndexerService {
     async recordSourceProgress(
         input: SourceProgressUpdateInput,
     ): Promise<SourceProgressWindow> {
-        const measuredAt = isoDateTimeWithMillis.parse(input.measuredAt);
+        const measuredAt = canonicalizeIsoDateTimeWithMillis(
+            isoDateTimeWithMillis.parse(input.measuredAt),
+        );
         const current = await this.store.getSourceProgress(
             input.tenantId,
             input.instanceId,
             input.source,
+        );
+        const inputLastIndexedEventTime = canonicalizeNullableIso(
+            input.lastIndexedEventTime,
+        );
+        const currentLastIndexedEventTime = canonicalizeNullableIso(
+            current?.lastIndexedEventTime ?? null,
         );
         const nextState: SourceProgressState = {
             cursor: input.cursor,
             instanceId: input.instanceId,
             lastBatchSize: input.lastBatchSize,
             lastIndexedEventTime: maxNullableIso(
-                current?.lastIndexedEventTime ?? null,
-                input.lastIndexedEventTime,
+                currentLastIndexedEventTime,
+                inputLastIndexedEventTime,
             ),
             lastIndexedOffset: maxNullableNumber(
                 current?.lastIndexedOffset ?? null,

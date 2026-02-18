@@ -105,3 +105,86 @@ test('rejects metadata outside rrs.metadata.allowlist.v1', async () => {
         })),
     );
 });
+
+test('normalizes second-precision manifest event_time to canonical millis',
+async () => {
+    const { indexer } = createIndexer();
+
+    await indexer.indexArtifact(buildTestInput({
+        eventId: 'evt-seconds-manifest',
+        eventTime: '2026-02-16T12:07:09Z',
+        metadata: {
+            __time: undefined,
+        },
+    }));
+
+    const status = await indexer.getPartitionWatermarkStatus({
+        instanceId: 'sn-dev-01',
+        partition: 0,
+        source: 'sn://acme-dev.service-now.com',
+        tenantId: 'tenant-acme',
+        topic: 'rez.cdc',
+    }, {
+        now: '2026-02-16T12:08:00Z',
+    });
+
+    assert.equal(
+        status.watermark?.coverage_start,
+        '2026-02-16T12:07:09.000Z',
+    );
+    assert.equal(
+        status.watermark?.coverage_end,
+        '2026-02-16T12:07:09.000Z',
+    );
+    assert.equal(
+        status.watermark?.indexed_through_time,
+        '2026-02-16T12:07:09.000Z',
+    );
+    assert.equal(status.watermark?.measured_at, '2026-02-16T12:08:00.000Z');
+
+    const coverage = await indexer.getSourceCoverageWindow(
+        'tenant-acme',
+        'sn-dev-01',
+        'sn://acme-dev.service-now.com',
+    );
+
+    assert.equal(
+        coverage?.earliest_indexed_time,
+        '2026-02-16T12:07:09.000Z',
+    );
+    assert.equal(
+        coverage?.latest_indexed_time,
+        '2026-02-16T12:07:09.000Z',
+    );
+});
+
+test('rejects invalid manifest fallback timestamp with field-specific error',
+async () => {
+    const { indexer } = createIndexer();
+
+    await assert.rejects(
+        indexer.indexArtifact(buildTestInput({
+            eventId: 'evt-invalid-manifest-time',
+            eventTime: '2026-02-16T12:07:09+00:00',
+            metadata: {
+                __time: undefined,
+            },
+        })),
+        /Invalid manifest\.event_time value/,
+    );
+});
+
+test('rejects invalid metadata timestamp with field-specific error',
+async () => {
+    const { indexer } = createIndexer();
+
+    await assert.rejects(
+        indexer.indexArtifact(buildTestInput({
+            eventId: 'evt-invalid-metadata-time',
+            metadata: {
+                __time: '2026-02-16T12:07:09+00:00',
+            },
+        })),
+        /Invalid metadata\.__time value/,
+    );
+});

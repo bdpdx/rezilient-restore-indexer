@@ -145,3 +145,53 @@ async () => {
     assert.equal(progress?.processed_count, 3);
     assert.equal(progress?.last_lag_seconds, 420);
 });
+
+test('continuous loop normalizes source progress event time to millis',
+async () => {
+    const scope = {
+        instanceId: 'sn-dev-01',
+        source: 'sn://acme-dev.service-now.com',
+        tenantId: 'tenant-acme',
+    };
+    const fixture = createFixture();
+    const source = new InMemoryArtifactBatchSource([
+        buildTestInput({
+            eventId: 'evt-loop-seconds-1',
+            eventTime: '2026-02-18T11:04:05Z',
+            metadata: {
+                __time: undefined,
+            },
+            offset: 1,
+        }),
+    ], 0);
+    const worker = new RestoreIndexerWorker(
+        source,
+        fixture.indexer,
+        2,
+        {
+            pollIntervalMs: 1,
+            sleep: async () => Promise.resolve(),
+            sourceProgressScope: scope,
+            timeProvider: () => '2026-02-18T11:05:00Z',
+        },
+    );
+
+    const result = await worker.runOnce();
+
+    assert.equal(result.batchSize, 1);
+    assert.equal(result.inserted, 1);
+    assert.equal(result.failures, 0);
+
+    const progress = await fixture.indexer.getSourceProgress(
+        scope.tenantId,
+        scope.instanceId,
+        scope.source,
+    );
+
+    assert.notEqual(progress, null);
+    assert.equal(
+        progress?.last_indexed_event_time,
+        '2026-02-18T11:04:05.000Z',
+    );
+    assert.equal(progress?.updated_at, '2026-02-18T11:05:00.000Z');
+});

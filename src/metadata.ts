@@ -1,4 +1,5 @@
 import {
+    canonicalizeIsoDateTimeWithMillis,
     isoDateTimeWithMillis,
     RESTORE_METADATA_ALLOWLIST_VERSION,
     RrsMetadataEnvelope,
@@ -85,6 +86,21 @@ function ensureTopicPartitionOffset(
     };
 }
 
+function canonicalizeTimestampField(
+    fieldPath: 'manifest.event_time' | 'metadata.__time',
+    value: unknown,
+): string {
+    if (typeof value !== 'string') {
+        throw new Error(`Invalid ${fieldPath} value type: expected string`);
+    }
+
+    try {
+        return canonicalizeIsoDateTimeWithMillis(value);
+    } catch {
+        throw new Error(`Invalid ${fieldPath} value: ${value}`);
+    }
+}
+
 export function normalizeOperationalMetadata(
     input: IndexArtifactInput,
 ): NormalizedMetadata {
@@ -136,7 +152,15 @@ export function normalizeOperationalMetadata(
     }
 
     if (merged.__time === undefined) {
-        merged.__time = input.manifest.event_time;
+        merged.__time = canonicalizeTimestampField(
+            'manifest.event_time',
+            input.manifest.event_time,
+        );
+    } else {
+        merged.__time = canonicalizeTimestampField(
+            'metadata.__time',
+            merged.__time,
+        );
     }
 
     for (const key of INTEGER_FIELDS) {
@@ -171,7 +195,10 @@ export function normalizeOperationalMetadata(
         throw new Error('Operational metadata is missing __time');
     }
 
-    const eventTime = isoDateTimeWithMillis.parse(metadata.__time);
+    const eventTime = canonicalizeIsoDateTimeWithMillis(
+        isoDateTimeWithMillis.parse(metadata.__time),
+    );
+    metadata.__time = eventTime;
 
     return {
         eventTime,
