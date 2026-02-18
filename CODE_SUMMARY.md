@@ -15,6 +15,8 @@ Entrypoints:
   SQLite-backed durable state stores.
 - `src/worker.ts`: cursor-aware batch worker with continuous polling loop and
   persisted source progress checkpoints.
+- `src/rec-manifest-source.ts`: production REC manifest object-store source
+  adapter with retrying reads and deterministic key cursoring.
 - `doc/runbooks.md`: RS-15 operator runbooks for lag, replay/generation, and
   freshness fail-closed incidents.
 
@@ -25,3 +27,4 @@ Tests:
 - `src/failure-modes.test.ts`
 - `src/durability.integration.test.ts`
 - `src/continuous-runtime.integration.test.ts`
+- `src/rec-manifest-source.test.ts`

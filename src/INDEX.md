@@ -4,6 +4,8 @@
 - `types.ts`: indexer input/output model types.
 - `env.ts`: environment parsing helpers.
 - `metadata.ts`: metadata allowlist validation and normalization.
+- `rec-manifest-source.ts`: object-store-backed REC manifest source adapter
+  with cursor paging, retries, and allowlisted metadata extraction.
 - `store.ts`: sidecar persistence interface plus in-memory/SQLite durable
   implementations.
 - `freshness.ts`: freshness/executability state evaluation.
@@ -21,3 +23,5 @@
   coverage, backfill state, and source progress checkpoints.
 - `continuous-runtime.integration.test.ts`: steady-state and lag/replay
   continuous loop processing tests.
+- `rec-manifest-source.test.ts`: REC manifest source adapter pagination,
+  retry, duplicate-suppression, and parsing tests.
