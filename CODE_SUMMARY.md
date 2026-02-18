@@ -17,6 +17,10 @@ Entrypoints:
   persisted source progress checkpoints.
 - `src/rec-manifest-source.ts`: production REC manifest object-store source
   adapter with retrying reads and deterministic key cursoring.
+- `src/rec-manifest-object-store-client.ts`: S3-backed object-store client used
+  by runtime REC manifest source wiring.
+- `src/runtime.ts`: fail-closed runtime bootstrap that selects production REC
+  source by default and allows explicit scaffold-only opt-in.
 - `doc/runbooks.md`: RS-15 operator runbooks for lag, replay/generation, and
   freshness fail-closed incidents.
 
@@ -24,6 +28,7 @@ Tests:
 - `src/watermark-invariants.test.ts`
 - `src/generation-replay.integration.test.ts`
 - `src/worker.integration.test.ts`
+- `src/runtime-bootstrap.test.ts`
 - `src/failure-modes.test.ts`
 - `src/durability.integration.test.ts`
 - `src/continuous-runtime.integration.test.ts`

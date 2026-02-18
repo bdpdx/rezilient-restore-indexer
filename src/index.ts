@@ -1,29 +1,8 @@
-import { parseIndexerEnv } from './env';
-import { RestoreIndexerService } from './indexer.service';
-import { SqliteRestoreIndexStore } from './store';
-import {
-    InMemoryArtifactBatchSource,
-    RestoreIndexerWorker,
-} from './worker';
+import { createRuntime } from './runtime';
 
 async function main(): Promise<void> {
-    const config = parseIndexerEnv(process.env);
-    const store = new SqliteRestoreIndexStore(config.stateDbPath);
-    const indexer = new RestoreIndexerService(store, {
-        freshnessPolicy: {
-            staleAfterSeconds: config.staleAfterSeconds,
-            timeoutSeconds: config.freshnessTimeoutSeconds,
-        },
-    });
-    const source = new InMemoryArtifactBatchSource();
-    const worker = new RestoreIndexerWorker(
-        source,
-        indexer,
-        config.batchSize,
-        {
-            pollIntervalMs: config.pollIntervalMs,
-        },
-    );
+    const runtime = createRuntime(process.env);
+    const { config, source, worker } = runtime;
     let stopping = false;
 
     const onSignal = (signal: NodeJS.Signals): void => {
@@ -44,11 +23,32 @@ async function main(): Promise<void> {
     }
 
     console.log('restore-indexer runtime started', {
+        artifact_source: source.mode,
         backfill_batch_size: config.backfillBatchSize,
+        default_tenant: config.defaultTenant,
+        object_store_bucket: source.mode === 'rec_manifest_object_store'
+            ? source.bucket
+            : null,
+        object_store_endpoint: source.mode === 'rec_manifest_object_store'
+            ? source.endpoint
+            : null,
+        object_store_prefix: source.mode === 'rec_manifest_object_store'
+            ? source.prefix
+            : null,
+        object_store_region: source.mode === 'rec_manifest_object_store'
+            ? source.region
+            : null,
         poll_interval_ms: config.pollIntervalMs,
         state_db_path: config.stateDbPath,
         stale_after_seconds: config.staleAfterSeconds,
     });
+
+    if (source.mode === 'in_memory_scaffold') {
+        console.warn(
+            'restore-indexer scaffold source mode enabled; '
+            + 'production ingest disabled by explicit operator opt-in',
+        );
+    }
 
     const result = await worker.runContinuously();
 

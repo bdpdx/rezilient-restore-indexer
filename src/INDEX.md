@@ -6,6 +6,10 @@
 - `metadata.ts`: metadata allowlist validation and normalization.
 - `rec-manifest-source.ts`: object-store-backed REC manifest source adapter
   with cursor paging, retries, and allowlisted metadata extraction.
+- `rec-manifest-object-store-client.ts`: S3 client wrapper for REC manifest
+  list/read operations.
+- `runtime.ts`: runtime bootstrap wiring for production REC source with
+  fail-closed source configuration.
 - `store.ts`: sidecar persistence interface plus in-memory/SQLite durable
   implementations.
 - `freshness.ts`: freshness/executability state evaluation.
@@ -18,6 +22,8 @@
 - `watermark-invariants.test.ts`: monotonicity unit tests.
 - `generation-replay.integration.test.ts`: replay/rewind generation tests.
 - `worker.integration.test.ts`: sidecar worker loop tests.
+- `runtime-bootstrap.test.ts`: startup fail-closed and runtime source wiring
+  tests.
 - `failure-modes.test.ts`: stale gate timeout and backfill starvation tests.
 - `durability.integration.test.ts`: restart-survival tests for watermark,
   coverage, backfill state, and source progress checkpoints.

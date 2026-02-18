@@ -12,6 +12,10 @@ Current stage behavior:
 - Evaluates strict fail-closed freshness states.
 - Runs bootstrap/gap-repair backfill controllers with lag guardrails.
 - Runs as a continuous worker service with graceful shutdown.
+- Uses REC manifest object-store source wiring by default at startup.
+- Fails closed at startup when required source configuration is missing.
+- Supports explicit non-production scaffold mode only with
+  `REZ_RESTORE_INDEXER_ARTIFACT_SOURCE=in_memory_scaffold`.
 - Includes RS-15 incident runbooks at `doc/runbooks.md`.
 
 Run local tests:
