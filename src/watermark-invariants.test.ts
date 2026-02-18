@@ -265,3 +265,52 @@ async () => {
         /Invalid metadata\.__time value/,
     );
 });
+
+test('processBatch emits per-artifact diagnostics for failed artifacts',
+async () => {
+    const { indexer } = createIndexer();
+    const valid = buildTestInput({
+        eventId: 'evt-batch-ok',
+    });
+    const invalid = buildTestInput({
+        eventId: 'evt-batch-fail',
+        metadata: {
+            short_description: 'plaintext not allowed',
+        },
+    });
+    const capturedErrors: unknown[][] = [];
+    const originalConsoleError = console.error;
+
+    console.error = (...args: unknown[]): void => {
+        capturedErrors.push(args);
+    };
+
+    try {
+        const summary = await indexer.processBatch([valid, invalid]);
+
+        assert.deepEqual(summary, {
+            existing: 0,
+            failures: 1,
+            inserted: 1,
+        });
+    } finally {
+        console.error = originalConsoleError;
+    }
+
+    assert.equal(capturedErrors.length, 1);
+    assert.equal(
+        capturedErrors[0]?.[0],
+        'restore-indexer artifact batch item failed',
+    );
+
+    const logPayload = capturedErrors[0]?.[1] as Record<string, unknown>;
+
+    assert.equal(logPayload.artifact_key, invalid.manifest.artifact_key);
+    assert.equal(logPayload.event_id, invalid.manifest.event_id);
+    assert.equal(logPayload.tenant_id, invalid.tenantId);
+    assert.equal(logPayload.source, invalid.manifest.source);
+    assert.equal(logPayload.topic, invalid.manifest.topic);
+    assert.equal(logPayload.partition, invalid.manifest.partition);
+    assert.equal(typeof logPayload.error_name, 'string');
+    assert.equal(typeof logPayload.error_message, 'string');
+});

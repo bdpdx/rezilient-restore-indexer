@@ -307,6 +307,103 @@ function buildNextWatermark(
     };
 }
 
+function readOptionalString(
+    value: unknown,
+): string | undefined {
+    if (typeof value !== 'string') {
+        return undefined;
+    }
+
+    if (value.trim() === '') {
+        return undefined;
+    }
+
+    return value;
+}
+
+function readOptionalPartition(
+    value: unknown,
+): number | undefined {
+    if (typeof value === 'number' && Number.isInteger(value)) {
+        return value;
+    }
+
+    if (typeof value !== 'string') {
+        return undefined;
+    }
+
+    const trimmed = value.trim();
+
+    if (!/^\d+$/.test(trimmed)) {
+        return undefined;
+    }
+
+    return Number.parseInt(trimmed, 10);
+}
+
+function readErrorDetails(
+    error: unknown,
+): {
+    errorMessage: string;
+    errorName: string;
+} {
+    if (error instanceof Error) {
+        return {
+            errorMessage: error.message,
+            errorName: error.name,
+        };
+    }
+
+    return {
+        errorMessage: String(error),
+        errorName: 'UnknownError',
+    };
+}
+
+function buildArtifactFailureContext(
+    input: IndexArtifactInput,
+): {
+    artifact_key: string;
+    event_id: string;
+    partition?: number;
+    source?: string;
+    tenant_id?: string;
+    topic?: string;
+} {
+    const metadata = input.metadata;
+    const metadataEventId = readOptionalString(metadata.event_id);
+    const metadataTenantId = readOptionalString(metadata.tenant_id);
+    const metadataSource = readOptionalString(metadata.source);
+    const metadataTopic = readOptionalString(metadata.topic);
+    const metadataPartition = readOptionalPartition(metadata.partition);
+
+    return {
+        artifact_key: input.manifest.artifact_key,
+        event_id: metadataEventId || input.manifest.event_id,
+        partition: metadataPartition ?? input.manifest.partition,
+        source: metadataSource || input.manifest.source,
+        tenant_id: metadataTenantId || input.tenantId,
+        topic: metadataTopic || input.manifest.topic,
+    };
+}
+
+function logArtifactBatchFailure(
+    input: IndexArtifactInput,
+    error: unknown,
+): void {
+    const context = buildArtifactFailureContext(input);
+    const details = readErrorDetails(error);
+
+    console.error(
+        'restore-indexer artifact batch item failed',
+        {
+            ...context,
+            error_message: details.errorMessage,
+            error_name: details.errorName,
+        },
+    );
+}
+
 export class RestoreIndexerService {
     constructor(
         private readonly store: RestoreIndexStore,
@@ -389,8 +486,9 @@ export class RestoreIndexerService {
                 } else {
                     existing += 1;
                 }
-            } catch (_error: unknown) {
+            } catch (error: unknown) {
                 failures += 1;
+                logArtifactBatchFailure(input, error);
             }
         }
 
