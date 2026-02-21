@@ -5,18 +5,21 @@
 - `env.ts`: environment parsing helpers.
 - `metadata.ts`: metadata allowlist validation and normalization.
 - `rec-manifest-source.ts`: object-store-backed REC manifest source adapter
-  with cursor paging, retries, and allowlisted metadata extraction.
+  with cursor paging, retries, extended manifest-key scanning, and allowlisted
+  metadata extraction.
 - `rec-manifest-object-store-client.ts`: S3 client wrapper for REC manifest
   list/read operations.
 - `runtime.ts`: runtime bootstrap wiring for production REC source with
   fail-closed source configuration.
 - `store.ts`: sidecar persistence interface plus in-memory/Postgres durable
-  implementations.
+  implementations aligned to restore-plane relational tables including
+  `source_progress` checkpoints.
 - `freshness.ts`: freshness/executability state evaluation.
 - `indexer.service.ts`: indexing core with generation-bound watermark logic.
 - `worker.ts`: cursor-aware source polling loop with continuous runtime
-  controls and source progress checkpointing.
-- `backfill.ts`: bootstrap and gap-repair controller.
+  controls, fail-closed cursor progression, and source progress checkpointing.
+- `backfill.ts`: bootstrap and gap-repair controller with fail-closed pause
+  semantics when indexing failures occur.
 - `index.ts`: local bootstrap.
 - `test-helpers.ts`: deterministic fixtures.
 - `watermark-invariants.test.ts`: monotonicity unit tests.

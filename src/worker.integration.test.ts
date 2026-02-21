@@ -56,3 +56,57 @@ test('worker polls source and writes indexed metadata batches', async () => {
     assert.equal(resumed.batchSize, 1);
     assert.equal(store.getIndexedEventCount(), 3);
 });
+
+test('worker keeps cursor pinned when a batch includes failures', async () => {
+    const store = new InMemoryRestoreIndexStore();
+    const indexer = new RestoreIndexerService(store, {
+        freshnessPolicy: {
+            staleAfterSeconds: 120,
+            timeoutSeconds: 60,
+        },
+    });
+    const valid = buildTestInput({
+        eventId: 'evt-worker-failure-ok',
+        offset: 1,
+    });
+    const invalid = buildTestInput({
+        eventId: 'evt-worker-failure-bad',
+        offset: 2,
+        metadata: {
+            short_description: 'plaintext not allowed',
+        },
+    });
+    const worker = new RestoreIndexerWorker(
+        new InMemoryArtifactBatchSource([valid, invalid]),
+        indexer,
+        10,
+    );
+
+    const first = await worker.runOnce();
+
+    assert.equal(first.batchSize, 2);
+    assert.equal(first.inserted, 1);
+    assert.equal(first.failures, 1);
+    assert.equal(first.cursor, null);
+    assert.equal(store.getIndexedEventCount(), 1);
+
+    const recoveryWorker = new RestoreIndexerWorker(
+        new InMemoryArtifactBatchSource([
+            valid,
+            buildTestInput({
+                eventId: 'evt-worker-failure-bad',
+                offset: 2,
+            }),
+        ]),
+        indexer,
+        10,
+    );
+    const recovered = await recoveryWorker.runOnce();
+
+    assert.equal(recovered.batchSize, 2);
+    assert.equal(recovered.inserted, 1);
+    assert.equal(recovered.existing, 1);
+    assert.equal(recovered.failures, 0);
+    assert.equal(recovered.cursor, '2');
+    assert.equal(store.getIndexedEventCount(), 2);
+});

@@ -22,6 +22,7 @@ const REC_ARTIFACT_MANIFEST_VERSION = 'rec.artifact-manifest.v1';
 const REC_OBJECT_KEY_LAYOUT_VERSION = 'rec.object-key-layout.v1';
 const DEFAULT_MAX_ATTEMPTS = 3;
 const DEFAULT_RETRY_BASE_MS = 200;
+const DEFAULT_LIST_PAGE_MIN_LIMIT = 100;
 const MANIFEST_SUFFIX = '.manifest.json';
 
 const TRANSIENT_ERROR_CODES = new Set([
@@ -594,20 +595,7 @@ export class RecManifestArtifactBatchSource implements ArtifactBatchSource {
             };
         }
 
-        const listedKeys = await this.withRetry('listObjectKeys', undefined,
-            async () => {
-                return this.client.listObjectKeys({
-                    limit: input.limit,
-                    prefix: this.prefix,
-                    startAfter: input.cursor,
-                });
-            });
-        const sortedKeys = extractManifestKeys(
-            listedKeys,
-            this.prefix,
-            input.cursor,
-        );
-        const selectedKeys = sortedKeys.slice(0, input.limit);
+        const selectedKeys = await this.collectManifestKeys(input);
         const items: IndexArtifactInput[] = [];
 
         for (const manifestKey of selectedKeys) {
@@ -626,6 +614,73 @@ export class RecManifestArtifactBatchSource implements ArtifactBatchSource {
                 this.timeProvider(),
             ),
         };
+    }
+
+    private async collectManifestKeys(input: {
+        cursor: string | null;
+        limit: number;
+    }): Promise<string[]> {
+        const selected = new Set<string>();
+        const pageLimit = Math.max(
+            DEFAULT_LIST_PAGE_MIN_LIMIT,
+            input.limit * 4,
+        );
+        let searchCursor = input.cursor;
+
+        while (selected.size < input.limit) {
+            const listedKeys = await this.withRetry(
+                'listObjectKeys',
+                undefined,
+                async () => {
+                    return this.client.listObjectKeys({
+                        limit: pageLimit,
+                        prefix: this.prefix,
+                        startAfter: searchCursor,
+                    });
+                },
+            );
+
+            if (listedKeys.length === 0) {
+                break;
+            }
+
+            const uniqueSortedPageKeys = Array.from(new Set(listedKeys))
+                .sort();
+            const pageManifestKeys = extractManifestKeys(
+                uniqueSortedPageKeys,
+                this.prefix,
+                input.cursor,
+            );
+
+            for (const manifestKey of pageManifestKeys) {
+                selected.add(manifestKey);
+
+                if (selected.size >= input.limit) {
+                    break;
+                }
+            }
+
+            if (uniqueSortedPageKeys.length < pageLimit) {
+                break;
+            }
+
+            const lastPageKey =
+                uniqueSortedPageKeys[uniqueSortedPageKeys.length - 1] || null;
+
+            if (lastPageKey === null) {
+                break;
+            }
+
+            if (searchCursor !== null && lastPageKey <= searchCursor) {
+                break;
+            }
+
+            searchCursor = lastPageKey;
+        }
+
+        return Array.from(selected)
+            .sort()
+            .slice(0, input.limit);
     }
 
     private async readManifestItem(

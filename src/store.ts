@@ -1,4 +1,8 @@
-import { Pool, type PoolClient, type PoolConfig } from 'pg';
+import { Pool, type PoolConfig } from 'pg';
+import {
+    canonicalizeIsoDateTimeWithMillis,
+    canonicalizeRestoreOffsetDecimalString,
+} from '@rezilient/types';
 import type {
     BackfillRunState,
     IndexedEventRecord,
@@ -244,105 +248,196 @@ export class InMemoryRestoreIndexStore implements RestoreIndexStore {
     }
 }
 
-type SnapshotRow = {
-    state_json: unknown;
-    version: number;
+type PartitionWatermarkRow = {
+    coverage_end: Date | string;
+    coverage_start: Date | string;
+    generation_id: string;
+    indexed_through_offset: number | string;
+    indexed_through_time: Date | string;
+    instance_id: string;
+    kafka_partition: number;
+    measured_at: Date | string;
+    source: string;
+    tenant_id: string;
+    topic: string;
 };
 
-type RestoreIndexSnapshot = {
-    backfill_runs: Record<string, BackfillRunState>;
-    indexed_events_by_key: Record<string, IndexedEventRecord>;
-    partition_watermarks_by_key: Record<string, PartitionWatermarkState>;
-    source_coverage_by_key: Record<string, SourceCoverageState>;
-    source_progress_by_key: Record<string, SourceProgressState>;
+type SourceCoverageRow = {
+    earliest_indexed_time: Date | string;
+    generation_span: unknown;
+    instance_id: string;
+    latest_indexed_time: Date | string;
+    measured_at: Date | string;
+    source: string;
+    tenant_id: string;
+};
+
+type SourceProgressRow = {
+    cursor: string | null;
+    instance_id: string;
+    last_batch_size: number;
+    last_indexed_event_time: Date | string | null;
+    last_indexed_offset: number | string | null;
+    last_lag_seconds: number | null;
+    processed_count: number | string;
+    source: string;
+    tenant_id: string;
+    updated_at: Date | string;
+};
+
+type BackfillRunRow = {
+    last_cursor: string | null;
+    max_realtime_lag_seconds: number;
+    mode: string;
+    pause_reason_code: string;
+    rows_processed: number | string;
+    run_id: string;
+    status: string;
+    throttle_batch_size: number;
+    updated_at: Date | string;
 };
 
 export type PostgresRestoreIndexStoreOptions = {
     pool?: Pool;
     poolConfig?: Omit<PoolConfig, 'connectionString'>;
     schemaName?: string;
+    sourceProgressTableName?: string;
     tableName?: string;
 };
 
-const DEFAULT_SNAPSHOT_SCHEMA = 'public';
-const DEFAULT_SNAPSHOT_TABLE = 'rri_state_snapshots';
+const DEFAULT_SCHEMA = 'rez_restore_index';
+const DEFAULT_SOURCE_PROGRESS_TABLE = 'source_progress';
+const PG_BIGINT_MAX = BigInt('9223372036854775807');
+const UNKNOWN_SCOPE = {
+    instanceId: 'unknown_instance',
+    source: 'unknown_source',
+    tenantId: 'unknown_tenant',
+} as const;
 
-function createEmptySnapshot(): RestoreIndexSnapshot {
-    return {
-        backfill_runs: {},
-        indexed_events_by_key: {},
-        partition_watermarks_by_key: {},
-        source_coverage_by_key: {},
-        source_progress_by_key: {},
-    };
+function canonicalizeTimestamp(
+    value: string | Date,
+    field: string,
+): string {
+    const input = value instanceof Date ? value.toISOString() : value;
+
+    try {
+        return canonicalizeIsoDateTimeWithMillis(String(input));
+    } catch {
+        throw new Error(`invalid ${field} timestamp`);
+    }
 }
 
-function serializeSnapshot(snapshot: RestoreIndexSnapshot): string {
-    return JSON.stringify(snapshot);
+function toIsoTimestamp(
+    value: Date | string | null,
+    field: string,
+): string | null {
+    if (value === null) {
+        return null;
+    }
+
+    const input = value instanceof Date ? value.toISOString() : String(value);
+
+    return canonicalizeTimestamp(input, field);
 }
 
-function parseSnapshot(raw: unknown): RestoreIndexSnapshot {
-    let parsed: unknown = raw;
+function toPgBigIntOffset(
+    value: string | number,
+    field: string,
+): string {
+    const canonical = canonicalizeRestoreOffsetDecimalString(value);
+    const parsed = BigInt(canonical);
 
-    if (typeof raw === 'string') {
-        parsed = JSON.parse(raw) as unknown;
+    if (parsed > PG_BIGINT_MAX) {
+        throw new Error(`${field} exceeds PostgreSQL BIGINT range`);
     }
 
-    if (!parsed || typeof parsed !== 'object') {
-        throw new Error('invalid persisted restore-index snapshot payload');
+    return canonical;
+}
+
+function parseJsonObject(
+    value: unknown,
+    field: string,
+): Record<string, string> {
+    let parsed = value;
+
+    if (typeof parsed === 'string') {
+        parsed = JSON.parse(parsed) as unknown;
     }
 
-    const snapshot = parsed as Partial<RestoreIndexSnapshot>;
-
-    if (
-        !snapshot.backfill_runs
-        || typeof snapshot.backfill_runs !== 'object'
-    ) {
-        throw new Error('invalid persisted backfill_runs payload');
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error(`invalid ${field} payload`);
     }
 
-    if (
-        !snapshot.indexed_events_by_key
-        || typeof snapshot.indexed_events_by_key !== 'object'
-    ) {
-        throw new Error('invalid persisted indexed_events_by_key payload');
+    const record = parsed as Record<string, unknown>;
+    const out: Record<string, string> = {};
+
+    for (const [key, rawValue] of Object.entries(record)) {
+        out[String(key)] = String(rawValue);
     }
 
-    if (
-        !snapshot.partition_watermarks_by_key
-        || typeof snapshot.partition_watermarks_by_key !== 'object'
-    ) {
-        throw new Error('invalid persisted partition_watermarks_by_key payload');
+    return out;
+}
+
+function parseInteger(
+    value: unknown,
+    field: string,
+): number {
+    const parsed = Number(value);
+
+    if (!Number.isInteger(parsed)) {
+        throw new Error(`invalid ${field} integer`);
     }
 
-    if (
-        !snapshot.source_coverage_by_key
-        || typeof snapshot.source_coverage_by_key !== 'object'
-    ) {
-        throw new Error('invalid persisted source_coverage_by_key payload');
+    return parsed;
+}
+
+function parseNonNegativeInteger(
+    value: unknown,
+    field: string,
+): number {
+    const parsed = parseInteger(value, field);
+
+    if (parsed < 0) {
+        throw new Error(`invalid ${field} integer`);
     }
 
-    if (
-        !snapshot.source_progress_by_key
-        || typeof snapshot.source_progress_by_key !== 'object'
-    ) {
-        throw new Error('invalid persisted source_progress_by_key payload');
+    return parsed;
+}
+
+function readOptionalString(
+    value: unknown,
+): string | null {
+    if (typeof value !== 'string') {
+        return null;
     }
 
-    return cloneState({
-        backfill_runs: snapshot.backfill_runs as Record<string, BackfillRunState>,
-        indexed_events_by_key:
-            snapshot.indexed_events_by_key as Record<string, IndexedEventRecord>,
-        partition_watermarks_by_key:
-            snapshot.partition_watermarks_by_key as Record<
-                string,
-                PartitionWatermarkState
-            >,
-        source_coverage_by_key:
-            snapshot.source_coverage_by_key as Record<string, SourceCoverageState>,
-        source_progress_by_key:
-            snapshot.source_progress_by_key as Record<string, SourceProgressState>,
-    });
+    const trimmed = value.trim();
+
+    return trimmed.length > 0 ? trimmed : null;
+}
+
+function readOptionalInteger(
+    value: unknown,
+): number | null {
+    if (typeof value !== 'number') {
+        return null;
+    }
+
+    if (!Number.isInteger(value)) {
+        return null;
+    }
+
+    return value;
+}
+
+function sanitizeOperation(
+    value: unknown,
+): 'I' | 'U' | 'D' | null {
+    if (value === 'I' || value === 'U' || value === 'D') {
+        return value;
+    }
+
+    return null;
 }
 
 function validateSqlIdentifier(
@@ -371,9 +466,21 @@ export class PostgresRestoreIndexStore implements RestoreIndexStore {
 
     private readonly ready: Promise<void>;
 
-    private readonly snapshotTableQualified: string;
+    private readonly schemaName: string;
 
-    private snapshot: RestoreIndexSnapshot = createEmptySnapshot();
+    private readonly indexEventsTableQualified: string;
+
+    private readonly partitionGenerationsTableQualified: string;
+
+    private readonly partitionWatermarksTableQualified: string;
+
+    private readonly sourceCoverageTableQualified: string;
+
+    private readonly sourceProgressTableQualified: string;
+
+    private readonly backfillRunsTableQualified: string;
+
+    private indexedEventCount = 0;
 
     constructor(
         pgUrl: string,
@@ -385,16 +492,27 @@ export class PostgresRestoreIndexStore implements RestoreIndexStore {
             throw new Error('REZ_RESTORE_PG_URL is required');
         }
 
-        const schemaName = validateSqlIdentifier(
-            options.schemaName || DEFAULT_SNAPSHOT_SCHEMA,
-            'snapshot schema name',
+        this.schemaName = validateSqlIdentifier(
+            options.schemaName || DEFAULT_SCHEMA,
+            'restore-index schema name',
         );
-        const tableName = validateSqlIdentifier(
-            options.tableName || DEFAULT_SNAPSHOT_TABLE,
-            'snapshot table name',
+        const sourceProgressTableName = validateSqlIdentifier(
+            options.sourceProgressTableName
+                || options.tableName
+                || DEFAULT_SOURCE_PROGRESS_TABLE,
+            'source progress table name',
         );
 
-        this.snapshotTableQualified = `"${schemaName}"."${tableName}"`;
+        this.indexEventsTableQualified = `"${this.schemaName}"."index_events"`;
+        this.partitionGenerationsTableQualified =
+            `"${this.schemaName}"."partition_generations"`;
+        this.partitionWatermarksTableQualified =
+            `"${this.schemaName}"."partition_watermarks"`;
+        this.sourceCoverageTableQualified =
+            `"${this.schemaName}"."source_coverage"`;
+        this.backfillRunsTableQualified = `"${this.schemaName}"."backfill_runs"`;
+        this.sourceProgressTableQualified =
+            `"${this.schemaName}"."${sourceProgressTableName}"`;
 
         if (options.pool) {
             this.pool = options.pool;
@@ -414,7 +532,7 @@ export class PostgresRestoreIndexStore implements RestoreIndexStore {
     }
 
     getIndexedEventCount(): number {
-        return Object.keys(this.snapshot.indexed_events_by_key).length;
+        return this.indexedEventCount;
     }
 
     async close(): Promise<void> {
@@ -428,43 +546,319 @@ export class PostgresRestoreIndexStore implements RestoreIndexStore {
     async upsertIndexedEvent(
         record: IndexedEventRecord,
     ): Promise<'inserted' | 'existing'> {
-        return this.mutateSnapshot((snapshot) => {
-            const key = eventKey(record);
+        await this.ensureReady();
 
-            if (snapshot.indexed_events_by_key[key]) {
-                return 'existing';
-            }
+        const eventId = readOptionalString(record.metadata.event_id)
+            || record.artifactKey;
+        const eventType = readOptionalString(record.metadata.event_type)
+            || 'unknown';
+        const eventTime = canonicalizeTimestamp(
+            readOptionalString(record.metadata.__time) || record.indexedAt,
+            'index event_time',
+        );
+        const kafkaOffsetRaw = record.metadata.offset;
 
-            snapshot.indexed_events_by_key[key] = cloneState(record);
+        if (typeof kafkaOffsetRaw !== 'string' && typeof kafkaOffsetRaw !== 'number') {
+            throw new Error('index event metadata.offset is required');
+        }
 
+        const kafkaOffset = toPgBigIntOffset(
+            kafkaOffsetRaw,
+            'index event kafka_offset',
+        );
+        const metadataRecord = record.metadata as Record<string, unknown>;
+        const manifestKey =
+            readOptionalString(metadataRecord.manifest_key)
+            || readOptionalString(metadataRecord.manifestKey)
+            || record.artifactKey.replace(/\.artifact\.json$/u, '.manifest.json');
+        const result = await this.pool.query(
+            `INSERT INTO ${this.indexEventsTableQualified} (
+                tenant_id,
+                instance_id,
+                source,
+                app,
+                table_name,
+                record_sys_id,
+                attachment_sys_id,
+                media_id,
+                event_id,
+                event_type,
+                operation,
+                schema_version,
+                sys_updated_on,
+                sys_mod_count,
+                event_time,
+                topic,
+                kafka_partition,
+                kafka_offset,
+                content_type,
+                size_bytes,
+                sha256_plain,
+                artifact_key,
+                manifest_key,
+                artifact_kind,
+                generation_id,
+                indexed_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                $11, $12, $13, $14, $15::timestamptz, $16, $17, $18::bigint,
+                $19, $20, $21, $22, $23, $24, $25, $26::timestamptz
+            )
+            ON CONFLICT (
+                tenant_id,
+                instance_id,
+                source,
+                topic,
+                kafka_partition,
+                generation_id,
+                event_id
+            ) DO NOTHING
+            RETURNING id`,
+            [
+                record.tenantId,
+                record.partitionScope.instanceId,
+                record.partitionScope.source,
+                record.app,
+                record.table,
+                readOptionalString(record.metadata.record_sys_id),
+                readOptionalString(record.metadata.attachment_sys_id),
+                readOptionalString(record.metadata.media_id),
+                eventId,
+                eventType,
+                sanitizeOperation(record.metadata.operation),
+                readOptionalInteger(record.metadata.schema_version),
+                readOptionalString(record.metadata.sys_updated_on),
+                readOptionalInteger(record.metadata.sys_mod_count),
+                eventTime,
+                record.partitionScope.topic,
+                record.partitionScope.partition,
+                kafkaOffset,
+                readOptionalString(record.metadata.content_type),
+                readOptionalInteger(record.metadata.size_bytes),
+                readOptionalString(record.metadata.sha256_plain),
+                record.artifactKey,
+                manifestKey,
+                record.artifactKind,
+                record.generationId,
+                canonicalizeTimestamp(record.indexedAt, 'index indexed_at'),
+            ],
+        );
+
+        if (result.rowCount === 1) {
+            this.indexedEventCount += 1;
             return 'inserted';
-        });
+        }
+
+        return 'existing';
     }
 
     async getPartitionWatermark(
         scope: PartitionScope,
     ): Promise<PartitionWatermarkState | null> {
         await this.ensureReady();
+        const result = await this.pool.query<PartitionWatermarkRow>(
+            `SELECT
+                tenant_id,
+                instance_id,
+                source,
+                topic,
+                kafka_partition,
+                generation_id,
+                indexed_through_offset::text AS indexed_through_offset,
+                indexed_through_time,
+                coverage_start,
+                coverage_end,
+                measured_at
+            FROM ${this.partitionWatermarksTableQualified}
+            WHERE tenant_id = $1
+              AND instance_id = $2
+              AND source = $3
+              AND topic = $4
+              AND kafka_partition = $5
+            LIMIT 1`,
+            [
+                scope.tenantId,
+                scope.instanceId,
+                scope.source,
+                scope.topic,
+                scope.partition,
+            ],
+        );
 
-        const state = this.snapshot.partition_watermarks_by_key[
-            partitionKey(scope)
-        ];
+        if (result.rowCount !== 1) {
+            return null;
+        }
 
-        return state ? cloneState(state) : null;
+        const row = result.rows[0];
+
+        return {
+            coverageEnd: toIsoTimestamp(
+                row.coverage_end,
+                'partition watermark coverage_end',
+            ) as string,
+            coverageStart: toIsoTimestamp(
+                row.coverage_start,
+                'partition watermark coverage_start',
+            ) as string,
+            generationId: row.generation_id,
+            indexedThroughOffset: canonicalizeRestoreOffsetDecimalString(
+                row.indexed_through_offset,
+            ),
+            indexedThroughTime: toIsoTimestamp(
+                row.indexed_through_time,
+                'partition watermark indexed_through_time',
+            ) as string,
+            instanceId: row.instance_id,
+            measuredAt: toIsoTimestamp(
+                row.measured_at,
+                'partition watermark measured_at',
+            ) as string,
+            partition: parseNonNegativeInteger(
+                row.kafka_partition,
+                'partition watermark kafka_partition',
+            ),
+            source: row.source,
+            tenantId: row.tenant_id,
+            topic: row.topic,
+        };
     }
 
     async putPartitionWatermark(state: PartitionWatermarkState): Promise<void> {
-        await this.mutateSnapshot((snapshot) => {
-            snapshot.partition_watermarks_by_key[
-                partitionKey({
-                    instanceId: state.instanceId,
-                    partition: state.partition,
-                    source: state.source,
-                    tenantId: state.tenantId,
-                    topic: state.topic,
-                })
-            ] = cloneState(state);
-        });
+        await this.ensureReady();
+
+        const indexedThroughOffset = toPgBigIntOffset(
+            state.indexedThroughOffset,
+            'partition watermark indexed_through_offset',
+        );
+        const indexedThroughTime = canonicalizeTimestamp(
+            state.indexedThroughTime,
+            'partition watermark indexed_through_time',
+        );
+        const coverageStart = canonicalizeTimestamp(
+            state.coverageStart,
+            'partition watermark coverage_start',
+        );
+        const coverageEnd = canonicalizeTimestamp(
+            state.coverageEnd,
+            'partition watermark coverage_end',
+        );
+        const measuredAt = canonicalizeTimestamp(
+            state.measuredAt,
+            'partition watermark measured_at',
+        );
+
+        await this.pool.query(
+            `INSERT INTO ${this.partitionWatermarksTableQualified} (
+                tenant_id,
+                instance_id,
+                source,
+                topic,
+                kafka_partition,
+                generation_id,
+                indexed_through_offset,
+                indexed_through_time,
+                coverage_start,
+                coverage_end,
+                freshness,
+                executability,
+                reason_code,
+                measured_at,
+                updated_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8::timestamptz, $9::timestamptz,
+                $10::timestamptz, 'fresh', 'executable', 'none',
+                $11::timestamptz, now()
+            )
+            ON CONFLICT (
+                tenant_id,
+                instance_id,
+                topic,
+                kafka_partition
+            ) DO UPDATE SET
+                source = EXCLUDED.source,
+                generation_id = EXCLUDED.generation_id,
+                indexed_through_offset = EXCLUDED.indexed_through_offset,
+                indexed_through_time = EXCLUDED.indexed_through_time,
+                coverage_start = EXCLUDED.coverage_start,
+                coverage_end = EXCLUDED.coverage_end,
+                freshness = EXCLUDED.freshness,
+                executability = EXCLUDED.executability,
+                reason_code = EXCLUDED.reason_code,
+                measured_at = EXCLUDED.measured_at,
+                updated_at = now()`,
+            [
+                state.tenantId,
+                state.instanceId,
+                state.source,
+                state.topic,
+                state.partition,
+                state.generationId,
+                indexedThroughOffset,
+                indexedThroughTime,
+                coverageStart,
+                coverageEnd,
+                measuredAt,
+            ],
+        );
+
+        await this.pool.query(
+            `INSERT INTO ${this.partitionGenerationsTableQualified} (
+                tenant_id,
+                instance_id,
+                source,
+                topic,
+                kafka_partition,
+                generation_id,
+                generation_started_at,
+                generation_ended_at,
+                max_indexed_offset,
+                max_indexed_time
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7::timestamptz, NULL,
+                $8, $9::timestamptz
+            )
+            ON CONFLICT (
+                tenant_id,
+                instance_id,
+                topic,
+                kafka_partition,
+                generation_id
+            ) DO UPDATE SET
+                source = EXCLUDED.source,
+                max_indexed_offset = EXCLUDED.max_indexed_offset,
+                max_indexed_time = EXCLUDED.max_indexed_time,
+                generation_ended_at = NULL`,
+            [
+                state.tenantId,
+                state.instanceId,
+                state.source,
+                state.topic,
+                state.partition,
+                state.generationId,
+                coverageStart,
+                indexedThroughOffset,
+                indexedThroughTime,
+            ],
+        );
+
+        await this.pool.query(
+            `UPDATE ${this.partitionGenerationsTableQualified}
+            SET generation_ended_at = COALESCE(generation_ended_at, $1::timestamptz)
+            WHERE tenant_id = $2
+              AND instance_id = $3
+              AND topic = $4
+              AND kafka_partition = $5
+              AND generation_id <> $6
+              AND generation_ended_at IS NULL`,
+            [
+                indexedThroughTime,
+                state.tenantId,
+                state.instanceId,
+                state.topic,
+                state.partition,
+                state.generationId,
+            ],
+        );
     }
 
     async recomputeSourceCoverage(input: {
@@ -473,26 +867,125 @@ export class PostgresRestoreIndexStore implements RestoreIndexStore {
         source: string;
         tenantId: string;
     }): Promise<SourceCoverageState | null> {
-        return this.mutateSnapshot((snapshot) => {
-            const key = sourceKey(
+        await this.ensureReady();
+
+        const measuredAt = canonicalizeTimestamp(
+            input.measuredAt,
+            'source coverage measured_at',
+        );
+        const result = await this.pool.query<PartitionWatermarkRow>(
+            `SELECT
+                tenant_id,
+                instance_id,
+                source,
+                topic,
+                kafka_partition,
+                generation_id,
+                indexed_through_offset::text AS indexed_through_offset,
+                indexed_through_time,
+                coverage_start,
+                coverage_end,
+                measured_at
+            FROM ${this.partitionWatermarksTableQualified}
+            WHERE tenant_id = $1
+              AND instance_id = $2
+              AND source = $3`,
+            [
                 input.tenantId,
                 input.instanceId,
                 input.source,
-            );
-            const state = recomputeCoverageFromWatermarks(
-                input,
-                Object.values(snapshot.partition_watermarks_by_key),
-            );
-
-            if (state === null) {
-                delete snapshot.source_coverage_by_key[key];
-                return null;
-            }
-
-            snapshot.source_coverage_by_key[key] = cloneState(state);
-
-            return cloneState(state);
+            ],
+        );
+        const watermarks = result.rows.map((row) => {
+            return {
+                coverageEnd: toIsoTimestamp(
+                    row.coverage_end,
+                    'source coverage coverage_end',
+                ) as string,
+                coverageStart: toIsoTimestamp(
+                    row.coverage_start,
+                    'source coverage coverage_start',
+                ) as string,
+                generationId: row.generation_id,
+                indexedThroughOffset: canonicalizeRestoreOffsetDecimalString(
+                    row.indexed_through_offset,
+                ),
+                indexedThroughTime: toIsoTimestamp(
+                    row.indexed_through_time,
+                    'source coverage indexed_through_time',
+                ) as string,
+                instanceId: row.instance_id,
+                measuredAt: toIsoTimestamp(
+                    row.measured_at,
+                    'source coverage measured_at',
+                ) as string,
+                partition: parseNonNegativeInteger(
+                    row.kafka_partition,
+                    'source coverage kafka_partition',
+                ),
+                source: row.source,
+                tenantId: row.tenant_id,
+                topic: row.topic,
+            };
         });
+        const state = recomputeCoverageFromWatermarks({
+            ...input,
+            measuredAt,
+        }, watermarks);
+
+        if (state === null) {
+            await this.pool.query(
+                `DELETE FROM ${this.sourceCoverageTableQualified}
+                WHERE tenant_id = $1
+                  AND instance_id = $2
+                  AND source = $3`,
+                [
+                    input.tenantId,
+                    input.instanceId,
+                    input.source,
+                ],
+            );
+            return null;
+        }
+
+        await this.pool.query(
+            `INSERT INTO ${this.sourceCoverageTableQualified} (
+                tenant_id,
+                instance_id,
+                source,
+                earliest_indexed_time,
+                latest_indexed_time,
+                generation_span,
+                measured_at
+            ) VALUES (
+                $1, $2, $3, $4::timestamptz, $5::timestamptz, $6::jsonb, $7::timestamptz
+            )
+            ON CONFLICT (tenant_id, instance_id, source) DO UPDATE SET
+                earliest_indexed_time = EXCLUDED.earliest_indexed_time,
+                latest_indexed_time = EXCLUDED.latest_indexed_time,
+                generation_span = EXCLUDED.generation_span,
+                measured_at = EXCLUDED.measured_at`,
+            [
+                state.tenantId,
+                state.instanceId,
+                state.source,
+                canonicalizeTimestamp(
+                    state.earliestIndexedTime,
+                    'source coverage earliest_indexed_time',
+                ),
+                canonicalizeTimestamp(
+                    state.latestIndexedTime,
+                    'source coverage latest_indexed_time',
+                ),
+                JSON.stringify(state.generationSpan),
+                canonicalizeTimestamp(
+                    state.measuredAt,
+                    'source coverage measured_at',
+                ),
+            ],
+        );
+
+        return cloneState(state);
     }
 
     async getSourceCoverage(
@@ -501,20 +994,110 @@ export class PostgresRestoreIndexStore implements RestoreIndexStore {
         source: string,
     ): Promise<SourceCoverageState | null> {
         await this.ensureReady();
+        const result = await this.pool.query<SourceCoverageRow>(
+            `SELECT
+                tenant_id,
+                instance_id,
+                source,
+                earliest_indexed_time,
+                latest_indexed_time,
+                generation_span,
+                measured_at
+            FROM ${this.sourceCoverageTableQualified}
+            WHERE tenant_id = $1
+              AND instance_id = $2
+              AND source = $3
+            LIMIT 1`,
+            [
+                tenantId,
+                instanceId,
+                source,
+            ],
+        );
 
-        const state = this.snapshot.source_coverage_by_key[
-            sourceKey(tenantId, instanceId, source)
-        ];
+        if (result.rowCount !== 1) {
+            return null;
+        }
 
-        return state ? cloneState(state) : null;
+        const row = result.rows[0];
+
+        return {
+            earliestIndexedTime: toIsoTimestamp(
+                row.earliest_indexed_time,
+                'source coverage earliest_indexed_time',
+            ) as string,
+            generationSpan: parseJsonObject(
+                row.generation_span,
+                'source coverage generation_span',
+            ),
+            instanceId: row.instance_id,
+            latestIndexedTime: toIsoTimestamp(
+                row.latest_indexed_time,
+                'source coverage latest_indexed_time',
+            ) as string,
+            measuredAt: toIsoTimestamp(
+                row.measured_at,
+                'source coverage measured_at',
+            ) as string,
+            source: row.source,
+            tenantId: row.tenant_id,
+        };
     }
 
     async putSourceProgress(state: SourceProgressState): Promise<void> {
-        await this.mutateSnapshot((snapshot) => {
-            snapshot.source_progress_by_key[
-                sourceKey(state.tenantId, state.instanceId, state.source)
-            ] = cloneState(state);
-        });
+        await this.ensureReady();
+
+        await this.pool.query(
+            `INSERT INTO ${this.sourceProgressTableQualified} (
+                tenant_id,
+                instance_id,
+                source,
+                cursor,
+                last_batch_size,
+                last_indexed_event_time,
+                last_indexed_offset,
+                last_lag_seconds,
+                processed_count,
+                updated_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6::timestamptz, $7, $8, $9, $10::timestamptz
+            )
+            ON CONFLICT (tenant_id, instance_id, source) DO UPDATE SET
+                cursor = EXCLUDED.cursor,
+                last_batch_size = EXCLUDED.last_batch_size,
+                last_indexed_event_time = EXCLUDED.last_indexed_event_time,
+                last_indexed_offset = EXCLUDED.last_indexed_offset,
+                last_lag_seconds = EXCLUDED.last_lag_seconds,
+                processed_count = EXCLUDED.processed_count,
+                updated_at = EXCLUDED.updated_at`,
+            [
+                state.tenantId,
+                state.instanceId,
+                state.source,
+                state.cursor,
+                Math.max(0, state.lastBatchSize),
+                state.lastIndexedEventTime === null
+                    ? null
+                    : canonicalizeTimestamp(
+                        state.lastIndexedEventTime,
+                        'source progress last_indexed_event_time',
+                    ),
+                state.lastIndexedOffset === null
+                    ? null
+                    : toPgBigIntOffset(
+                        state.lastIndexedOffset,
+                        'source progress last_indexed_offset',
+                    ),
+                state.lastLagSeconds === null
+                    ? null
+                    : Math.max(0, state.lastLagSeconds),
+                Math.max(0, state.processedCount),
+                canonicalizeTimestamp(
+                    state.updatedAt,
+                    'source progress updated_at',
+                ),
+            ],
+        );
     }
 
     async getSourceProgress(
@@ -523,26 +1106,186 @@ export class PostgresRestoreIndexStore implements RestoreIndexStore {
         source: string,
     ): Promise<SourceProgressState | null> {
         await this.ensureReady();
+        const result = await this.pool.query<SourceProgressRow>(
+            `SELECT
+                tenant_id,
+                instance_id,
+                source,
+                cursor,
+                last_batch_size,
+                last_indexed_event_time,
+                last_indexed_offset::text AS last_indexed_offset,
+                last_lag_seconds,
+                processed_count,
+                updated_at
+            FROM ${this.sourceProgressTableQualified}
+            WHERE tenant_id = $1
+              AND instance_id = $2
+              AND source = $3
+            LIMIT 1`,
+            [
+                tenantId,
+                instanceId,
+                source,
+            ],
+        );
 
-        const state = this.snapshot.source_progress_by_key[
-            sourceKey(tenantId, instanceId, source)
-        ];
+        if (result.rowCount !== 1) {
+            return null;
+        }
 
-        return state ? cloneState(state) : null;
+        const row = result.rows[0];
+
+        return {
+            cursor: row.cursor,
+            instanceId: row.instance_id,
+            lastBatchSize: parseNonNegativeInteger(
+                row.last_batch_size,
+                'source progress last_batch_size',
+            ),
+            lastIndexedEventTime: toIsoTimestamp(
+                row.last_indexed_event_time,
+                'source progress last_indexed_event_time',
+            ),
+            lastIndexedOffset: row.last_indexed_offset === null
+                ? null
+                : canonicalizeRestoreOffsetDecimalString(row.last_indexed_offset),
+            lastLagSeconds: row.last_lag_seconds === null
+                ? null
+                : parseNonNegativeInteger(
+                    row.last_lag_seconds,
+                    'source progress last_lag_seconds',
+                ),
+            processedCount: parseNonNegativeInteger(
+                row.processed_count,
+                'source progress processed_count',
+            ),
+            source: row.source,
+            tenantId: row.tenant_id,
+            updatedAt: toIsoTimestamp(
+                row.updated_at,
+                'source progress updated_at',
+            ) as string,
+        };
     }
 
     async upsertBackfillRun(state: BackfillRunState): Promise<void> {
-        await this.mutateSnapshot((snapshot) => {
-            snapshot.backfill_runs[state.runId] = cloneState(state);
-        });
+        await this.ensureReady();
+
+        const scoped = state as BackfillRunState & {
+            instanceId?: string;
+            source?: string;
+            tenantId?: string;
+        };
+        const tenantId = readOptionalString(scoped.tenantId)
+            || UNKNOWN_SCOPE.tenantId;
+        const instanceId = readOptionalString(scoped.instanceId)
+            || UNKNOWN_SCOPE.instanceId;
+        const source = readOptionalString(scoped.source) || UNKNOWN_SCOPE.source;
+        const updatedAt = canonicalizeTimestamp(
+            state.updatedAt,
+            'backfill run updated_at',
+        );
+
+        await this.pool.query(
+            `INSERT INTO ${this.backfillRunsTableQualified} (
+                run_id,
+                tenant_id,
+                instance_id,
+                source,
+                mode,
+                status,
+                pause_reason_code,
+                throttle_batch_size,
+                max_realtime_lag_seconds,
+                last_cursor,
+                rows_processed,
+                started_at,
+                updated_at,
+                completed_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8,
+                $9, $10, $11, $12::timestamptz, $13::timestamptz, $14::timestamptz
+            )
+            ON CONFLICT (run_id) DO UPDATE SET
+                mode = EXCLUDED.mode,
+                status = EXCLUDED.status,
+                pause_reason_code = EXCLUDED.pause_reason_code,
+                throttle_batch_size = EXCLUDED.throttle_batch_size,
+                max_realtime_lag_seconds = EXCLUDED.max_realtime_lag_seconds,
+                last_cursor = EXCLUDED.last_cursor,
+                rows_processed = EXCLUDED.rows_processed,
+                updated_at = EXCLUDED.updated_at,
+                completed_at = EXCLUDED.completed_at`,
+            [
+                state.runId,
+                tenantId,
+                instanceId,
+                source,
+                state.mode,
+                state.status,
+                state.reasonCode,
+                Math.max(1, state.throttleBatchSize),
+                Math.max(0, state.maxRealtimeLagSeconds),
+                state.cursor,
+                Math.max(0, state.processedCount),
+                updatedAt,
+                updatedAt,
+                state.status === 'completed' ? updatedAt : null,
+            ],
+        );
     }
 
     async getBackfillRun(runId: string): Promise<BackfillRunState | null> {
         await this.ensureReady();
+        const result = await this.pool.query<BackfillRunRow>(
+            `SELECT
+                run_id,
+                mode,
+                status,
+                pause_reason_code,
+                throttle_batch_size,
+                max_realtime_lag_seconds,
+                last_cursor,
+                rows_processed,
+                updated_at
+            FROM ${this.backfillRunsTableQualified}
+            WHERE run_id = $1
+            LIMIT 1`,
+            [
+                runId,
+            ],
+        );
 
-        const state = this.snapshot.backfill_runs[runId];
+        if (result.rowCount !== 1) {
+            return null;
+        }
 
-        return state ? cloneState(state) : null;
+        const row = result.rows[0];
+
+        return {
+            cursor: row.last_cursor,
+            maxRealtimeLagSeconds: parseNonNegativeInteger(
+                row.max_realtime_lag_seconds,
+                'backfill run max_realtime_lag_seconds',
+            ),
+            mode: row.mode as BackfillRunState['mode'],
+            processedCount: parseNonNegativeInteger(
+                row.rows_processed,
+                'backfill run rows_processed',
+            ),
+            reasonCode: row.pause_reason_code,
+            runId: row.run_id,
+            status: row.status as BackfillRunState['status'],
+            throttleBatchSize: parseNonNegativeInteger(
+                row.throttle_batch_size,
+                'backfill run throttle_batch_size',
+            ),
+            updatedAt: toIsoTimestamp(
+                row.updated_at,
+                'backfill run updated_at',
+            ) as string,
+        };
     }
 
     private async ensureReady(): Promise<void> {
@@ -550,145 +1293,234 @@ export class PostgresRestoreIndexStore implements RestoreIndexStore {
     }
 
     private async initialize(): Promise<void> {
-        await this.pool.query(this.createTableSql());
-        await this.pool.query(
-            `INSERT INTO ${this.snapshotTableQualified} (
-                snapshot_id,
-                version,
-                state_json,
-                updated_at
-            )
-            SELECT
-                1,
-                $1::bigint,
-                $2::jsonb,
-                now()
-            WHERE NOT EXISTS (
-                SELECT 1
-                FROM ${this.snapshotTableQualified}
-                WHERE snapshot_id = 1
-            )`,
-            [
-                0,
-                serializeSnapshot(createEmptySnapshot()),
-            ],
+        await this.pool.query(`CREATE SCHEMA IF NOT EXISTS "${this.schemaName}"`);
+        await this.pool.query(this.createIndexEventsSql());
+        await this.pool.query(this.createPartitionWatermarksSql());
+        await this.pool.query(this.createPartitionGenerationsSql());
+        await this.pool.query(this.createSourceCoverageSql());
+        await this.pool.query(this.createBackfillRunsSql());
+        await this.pool.query(this.createSourceProgressSql());
+
+        const countResult = await this.pool.query<{
+            count: string;
+        }>(
+            `SELECT COUNT(*)::text AS count
+            FROM ${this.indexEventsTableQualified}`,
         );
 
-        const row = await this.selectSnapshot();
-
-        if (!row) {
-            throw new Error('failed to load restore-index snapshot state');
-        }
-
-        this.snapshot = parseSnapshot(row.state_json);
-    }
-
-    private async mutateSnapshot<T>(
-        mutator: (snapshot: RestoreIndexSnapshot) => T,
-    ): Promise<T> {
-        await this.ensureReady();
-
-        const client = await this.pool.connect();
-
-        try {
-            await client.query('BEGIN');
-
-            const row = await this.selectSnapshotForTransaction(client);
-            const working = parseSnapshot(row.state_json);
-            const result = mutator(working);
-            const nextVersion = row.version + 1;
-
-            await client.query(
-                `UPDATE ${this.snapshotTableQualified}
-                SET version = $1::bigint,
-                    state_json = $2::jsonb,
-                    updated_at = now()
-                WHERE snapshot_id = 1`,
-                [
-                    nextVersion,
-                    serializeSnapshot(working),
-                ],
-            );
-
-            await client.query('COMMIT');
-
-            this.snapshot = cloneState(working);
-
-            return result;
-        } catch (error) {
-            await client.query('ROLLBACK');
-            throw error;
-        } finally {
-            client.release();
-        }
-    }
-
-    private async selectSnapshot(): Promise<SnapshotRow | null> {
-        const result = await this.pool.query<SnapshotRow>(
-            `SELECT version, state_json
-            FROM ${this.snapshotTableQualified}
-            WHERE snapshot_id = 1
-            ORDER BY version DESC
-            LIMIT 1`,
+        this.indexedEventCount = parseNonNegativeInteger(
+            countResult.rows[0]?.count || 0,
+            'indexed event count',
         );
-
-        if (result.rowCount !== 1) {
-            return null;
-        }
-
-        return result.rows[0];
     }
 
-    private async selectSnapshotForTransaction(
-        client: PoolClient,
-    ): Promise<SnapshotRow> {
-        const result = await client.query<SnapshotRow>(
-            `SELECT version, state_json
-            FROM ${this.snapshotTableQualified}
-            WHERE snapshot_id = 1
-            ORDER BY version DESC
-            LIMIT 1
-            FOR UPDATE`,
-        );
-
-        if (result.rowCount === 1) {
-            return result.rows[0];
-        }
-
-        const emptySnapshot = createEmptySnapshot();
-
-        await client.query(
-            `INSERT INTO ${this.snapshotTableQualified} (
-                snapshot_id,
-                version,
-                state_json,
-                updated_at
-            ) VALUES (
-                1,
-                $1::bigint,
-                $2::jsonb,
-                now()
-            )`,
-            [
-                0,
-                serializeSnapshot(emptySnapshot),
-            ],
-        );
-
-        return {
-            state_json: serializeSnapshot(emptySnapshot),
-            version: 0,
-        };
-    }
-
-    private createTableSql(): string {
+    private createIndexEventsSql(): string {
         return `
-CREATE TABLE IF NOT EXISTS ${this.snapshotTableQualified} (
-    snapshot_id INTEGER,
-    version BIGINT,
-    state_json JSONB,
+CREATE TABLE IF NOT EXISTS ${this.indexEventsTableQualified} (
+    id BIGSERIAL,
+    tenant_id TEXT,
+    instance_id TEXT,
+    source TEXT,
+    app TEXT,
+    table_name TEXT,
+    record_sys_id TEXT,
+    attachment_sys_id TEXT,
+    media_id TEXT,
+    event_id TEXT,
+    event_type TEXT,
+    operation TEXT,
+    schema_version INTEGER,
+    sys_updated_on TEXT,
+    sys_mod_count INTEGER,
+    event_time TIMESTAMPTZ,
+    topic TEXT,
+    kafka_partition INTEGER,
+    kafka_offset TEXT,
+    content_type TEXT,
+    size_bytes BIGINT,
+    sha256_plain CHAR(64),
+    artifact_key TEXT,
+    manifest_key TEXT,
+    artifact_kind TEXT,
+    generation_id TEXT,
+    indexed_at TIMESTAMPTZ
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_index_events_dedupe
+ON ${this.indexEventsTableQualified} (
+    tenant_id,
+    instance_id,
+    source,
+    topic,
+    kafka_partition,
+    generation_id,
+    event_id
+);
+
+CREATE INDEX IF NOT EXISTS ix_index_events_lookup
+ON ${this.indexEventsTableQualified} (
+    tenant_id,
+    instance_id,
+    source,
+    table_name,
+    record_sys_id,
+    event_time
+);
+
+CREATE INDEX IF NOT EXISTS ix_index_events_partition_offsets
+ON ${this.indexEventsTableQualified} (
+    tenant_id,
+    instance_id,
+    topic,
+    kafka_partition,
+    kafka_offset DESC
+);
+`;
+    }
+
+    private createPartitionWatermarksSql(): string {
+        return `
+CREATE TABLE IF NOT EXISTS ${this.partitionWatermarksTableQualified} (
+    tenant_id TEXT,
+    instance_id TEXT,
+    source TEXT,
+    topic TEXT,
+    kafka_partition INTEGER,
+    generation_id TEXT,
+    indexed_through_offset TEXT,
+    indexed_through_time TIMESTAMPTZ,
+    coverage_start TIMESTAMPTZ,
+    coverage_end TIMESTAMPTZ,
+    freshness TEXT,
+    executability TEXT,
+    reason_code TEXT,
+    measured_at TIMESTAMPTZ,
     updated_at TIMESTAMPTZ
-)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_partition_watermarks_scope
+ON ${this.partitionWatermarksTableQualified} (
+    tenant_id,
+    instance_id,
+    topic,
+    kafka_partition
+);
+
+CREATE INDEX IF NOT EXISTS ix_partition_watermarks_source
+ON ${this.partitionWatermarksTableQualified} (
+    tenant_id,
+    instance_id,
+    source,
+    topic,
+    kafka_partition
+);
+`;
+    }
+
+    private createPartitionGenerationsSql(): string {
+        return `
+CREATE TABLE IF NOT EXISTS ${this.partitionGenerationsTableQualified} (
+    tenant_id TEXT,
+    instance_id TEXT,
+    source TEXT,
+    topic TEXT,
+    kafka_partition INTEGER,
+    generation_id TEXT,
+    generation_started_at TIMESTAMPTZ,
+    generation_ended_at TIMESTAMPTZ,
+    max_indexed_offset TEXT,
+    max_indexed_time TIMESTAMPTZ
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_partition_generations_scope
+ON ${this.partitionGenerationsTableQualified} (
+    tenant_id,
+    instance_id,
+    topic,
+    kafka_partition,
+    generation_id
+);
+`;
+    }
+
+    private createSourceCoverageSql(): string {
+        return `
+CREATE TABLE IF NOT EXISTS ${this.sourceCoverageTableQualified} (
+    tenant_id TEXT,
+    instance_id TEXT,
+    source TEXT,
+    earliest_indexed_time TIMESTAMPTZ,
+    latest_indexed_time TIMESTAMPTZ,
+    generation_span JSONB,
+    measured_at TIMESTAMPTZ
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_source_coverage_scope
+ON ${this.sourceCoverageTableQualified} (
+    tenant_id,
+    instance_id,
+    source
+);
+`;
+    }
+
+    private createBackfillRunsSql(): string {
+        return `
+CREATE TABLE IF NOT EXISTS ${this.backfillRunsTableQualified} (
+    run_id TEXT,
+    tenant_id TEXT,
+    instance_id TEXT,
+    source TEXT,
+    mode TEXT,
+    status TEXT,
+    pause_reason_code TEXT,
+    throttle_batch_size INTEGER,
+    max_realtime_lag_seconds INTEGER,
+    last_cursor TEXT,
+    rows_processed BIGINT,
+    started_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_backfill_runs_run_id
+ON ${this.backfillRunsTableQualified} (
+    run_id
+);
+
+CREATE INDEX IF NOT EXISTS ix_backfill_runs_lookup
+ON ${this.backfillRunsTableQualified} (
+    tenant_id,
+    instance_id,
+    source,
+    mode,
+    status,
+    updated_at DESC
+);
+`;
+    }
+
+    private createSourceProgressSql(): string {
+        return `
+CREATE TABLE IF NOT EXISTS ${this.sourceProgressTableQualified} (
+    tenant_id TEXT,
+    instance_id TEXT,
+    source TEXT,
+    cursor TEXT,
+    last_batch_size INTEGER,
+    last_indexed_event_time TIMESTAMPTZ,
+    last_indexed_offset TEXT,
+    last_lag_seconds INTEGER,
+    processed_count BIGINT,
+    updated_at TIMESTAMPTZ
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_source_progress_scope
+ON ${this.sourceProgressTableQualified} (
+    tenant_id,
+    instance_id,
+    source
+);
 `;
     }
 }

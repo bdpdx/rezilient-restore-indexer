@@ -118,3 +118,48 @@ async () => {
     assert.equal(state.processedCount, 0);
     assert.equal(store.getIndexedEventCount(), 0);
 });
+
+test('backfill controller pauses fail-closed on indexing failures', async () => {
+    const store = new InMemoryRestoreIndexStore();
+    const indexer = new RestoreIndexerService(store, {
+        freshnessPolicy: {
+            staleAfterSeconds: 120,
+            timeoutSeconds: 60,
+        },
+    });
+    const source = new InMemoryBackfillBatchSource([
+        buildTestInput({
+            eventId: 'evt-backfill-idx-ok',
+            ingestionMode: 'bootstrap',
+            offset: 1,
+        }),
+        buildTestInput({
+            eventId: 'evt-backfill-idx-bad',
+            ingestionMode: 'bootstrap',
+            offset: 2,
+            metadata: {
+                short_description: 'plaintext not allowed',
+            },
+        }),
+    ], 0);
+    const backfill = new BackfillController(
+        'bootstrap',
+        source,
+        indexer,
+        store,
+        {
+            maxRealtimeLagSeconds: 180,
+            runId: 'run-backfill-indexing-failure',
+            throttleBatchSize: 100,
+            timeProvider: () => '2026-02-16T12:21:00.000Z',
+        },
+    );
+
+    const state = await backfill.tick();
+
+    assert.equal(state.status, 'paused');
+    assert.equal(state.reasonCode, 'paused_indexing_failures');
+    assert.equal(state.cursor, null);
+    assert.equal(state.processedCount, 1);
+    assert.equal(store.getIndexedEventCount(), 1);
+});

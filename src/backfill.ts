@@ -137,6 +137,22 @@ export class BackfillController {
         });
         const result = await this.indexer.processBatch(items);
 
+        if (result.failures > 0) {
+            this.state = {
+                ...this.state,
+                processedCount: this.state.processedCount
+                    + result.inserted
+                    + result.existing,
+                reasonCode: 'paused_indexing_failures',
+                status: 'paused',
+                updatedAt: this.timeProvider(),
+            };
+
+            await this.store.upsertBackfillRun(this.state);
+
+            return this.getState();
+        }
+
         this.state = {
             ...this.state,
             cursor: batch.nextCursor,

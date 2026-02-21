@@ -207,15 +207,22 @@ export class RestoreIndexerWorker {
             limit: this.batchSize,
         });
         const result = await this.indexer.processBatch(batch.items);
+        const advanceCursor = result.failures === 0;
+        const nextCursor = advanceCursor
+            ? batch.nextCursor
+            : this.cursor;
 
-        this.cursor = batch.nextCursor;
+        this.cursor = nextCursor;
 
-        await this.persistSourceProgress(batch, result);
+        await this.persistSourceProgress(batch, result, {
+            advanceCursor,
+            nextCursor,
+        });
 
         return {
             ...result,
             batchSize: batch.items.length,
-            cursor: batch.nextCursor,
+            cursor: nextCursor,
             realtimeLagSeconds: batch.realtimeLagSeconds,
         };
     }
@@ -287,18 +294,26 @@ export class RestoreIndexerWorker {
     private async persistSourceProgress(
         batch: ArtifactBatch,
         result: ProcessBatchResult,
+        cursor: {
+            advanceCursor: boolean;
+            nextCursor: string | null;
+        },
     ): Promise<void> {
         if (!this.sourceProgressScope) {
             return;
         }
 
+        const progressItems = cursor.advanceCursor ? batch.items : [];
+
         await this.indexer.recordSourceProgress({
-            cursor: batch.nextCursor,
+            cursor: cursor.nextCursor,
             instanceId: this.sourceProgressScope.instanceId,
             lastBatchSize: batch.items.length,
-            lastIndexedEventTime: latestEventTime(batch.items),
-            lastIndexedOffset: latestOffset(batch.items),
-            lastLagSeconds: batch.realtimeLagSeconds,
+            lastIndexedEventTime: latestEventTime(progressItems),
+            lastIndexedOffset: latestOffset(progressItems),
+            lastLagSeconds: cursor.advanceCursor
+                ? batch.realtimeLagSeconds
+                : null,
             measuredAt: this.timeProvider(),
             processedDelta: result.inserted + result.existing + result.failures,
             source: this.sourceProgressScope.source,

@@ -1,5 +1,20 @@
 # Restore Indexer Runbooks (RS-15)
 
+## REC -> RRI Polling Contract
+
+1. REC is the producer of canonical `*.manifest.json` objects under the shared
+   restore prefix/bucket.
+2. RRI is poll-driven (no push callback). It discovers manifests by listing
+   object keys and reading manifest/artifact pairs.
+3. RRI cursor advancement is fail-closed:
+   - cursor advances only when the full batch indexes without failures,
+   - any batch failure keeps the previous cursor and replays deterministically
+     on the next cycle.
+4. Backfill uses the same fail-closed rule: indexing failures pause backfill
+   with `paused_indexing_failures` and do not advance cursor.
+5. Operators should treat repeated cursor pinning as an indexing incident and
+   resolve the bad artifact/metadata before expecting forward progress.
+
 ## 1. Sidecar Lag / Freshness Breach
 
 1. Query freshness status in restore admin:

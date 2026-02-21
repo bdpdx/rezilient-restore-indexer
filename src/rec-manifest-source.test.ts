@@ -320,6 +320,70 @@ async () => {
     );
 });
 
+test('rec manifest source keeps scanning when early pages contain no manifests',
+async () => {
+    const prefix = 'rez/restore-artifacts';
+    const manifestKey001 = manifestKey(prefix, 'scan-001');
+    const artifactKey001 = artifactKey(prefix, 'scan-001');
+    const noisyPage = Array.from({
+        length: 100,
+    }, (_, index) => {
+        const padded = String(index).padStart(3, '0');
+
+        return `${prefix}/noise-${padded}.txt`;
+    });
+    const client = new ScriptedObjectStoreClient([
+        {
+            keys: noisyPage,
+        },
+        {
+            keys: [manifestKey001],
+        },
+    ], new Map([
+        [
+            manifestKey001,
+            [{
+                body: JSON.stringify(buildManifest({
+                    artifactKey: artifactKey001,
+                    eventId: 'evt-scan-001',
+                    eventTime: '2026-02-18T12:00:00.000Z',
+                    offset: '1',
+                })),
+            }],
+        ],
+        [
+            artifactKey001,
+            [{
+                body: JSON.stringify(buildCdcArtifact({
+                    eventId: 'evt-scan-001',
+                    eventTime: '2026-02-18T12:00:00.000Z',
+                })),
+            }],
+        ],
+    ]));
+    const source = new RecManifestArtifactBatchSource(client, {
+        generationId: 'gen-rec',
+        prefix,
+        tenantId: 'tenant-acme',
+        timeProvider: () => '2026-02-18T12:00:30.000Z',
+    });
+
+    const batch = await source.readBatch({
+        cursor: null,
+        limit: 1,
+    });
+
+    assert.equal(batch.items.length, 1);
+    assert.equal(batch.items[0]?.manifest.event_id, 'evt-scan-001');
+    assert.equal(batch.nextCursor, manifestKey001);
+    assert.equal(client.listCalls.length, 2);
+    assert.equal(client.listCalls[0]?.startAfter, null);
+    assert.equal(
+        client.listCalls[1]?.startAfter,
+        `${prefix}/noise-099.txt`,
+    );
+});
+
 test('rec manifest source retries transient errors and suppresses duplicates',
 async () => {
     const prefix = 'rez/restore-artifacts';
