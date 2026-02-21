@@ -28,7 +28,7 @@ export type RestoreIndexerEnv = {
     freshnessTimeoutSeconds: number;
     pollIntervalMs: number;
     recManifestSource?: RecManifestObjectStoreSourceEnv;
-    stateDbPath: string;
+    restorePgUrl: string;
     staleAfterSeconds: number;
 };
 
@@ -161,13 +161,12 @@ export function parseIndexerEnv(
         );
     }
 
-    const stateDbPath = String(
-        env.REZ_RESTORE_INDEXER_STATE_DB_PATH || '',
-    ).trim();
+    const restorePgUrl = readOptionalString(env.REZ_RESTORE_PG_URL)
+        || readOptionalString(env.REZ_RESTORE_INDEXER_PG_URL);
 
-    if (!stateDbPath) {
+    if (!restorePgUrl) {
         throw new Error(
-            'REZ_RESTORE_INDEXER_STATE_DB_PATH is required',
+            'REZ_RESTORE_PG_URL is required',
         );
     }
 
@@ -257,7 +256,7 @@ export function parseIndexerEnv(
             1000,
         ),
         recManifestSource,
-        stateDbPath,
+        restorePgUrl,
         staleAfterSeconds: parsePositiveInt(
             env.REZ_RESTORE_INDEXER_STALE_AFTER_SECONDS,
             120,

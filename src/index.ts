@@ -39,7 +39,7 @@ async function main(): Promise<void> {
             ? source.region
             : null,
         poll_interval_ms: config.pollIntervalMs,
-        state_db_path: config.stateDbPath,
+        restore_pg_url_configured: Boolean(config.restorePgUrl),
         stale_after_seconds: config.staleAfterSeconds,
     });
 

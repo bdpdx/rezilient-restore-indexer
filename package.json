@@ -5,6 +5,9 @@
     "license": "UNLICENSED",
     "type": "commonjs",
     "main": "dist/index.js",
+    "engines": {
+        "node": ">=22.0.0"
+    },
     "scripts": {
         "build": "tsc -p tsconfig.json",
         "start": "node dist/index.js",
@@ -13,10 +16,13 @@
     },
     "dependencies": {
         "@aws-sdk/client-s3": "^3.991.0",
-        "@rezilient/types": "file:../rezilient-types"
+        "@rezilient/types": "file:../rezilient-types",
+        "pg": "^8.18.0"
     },
     "devDependencies": {
         "@types/node": "^24.7.2",
+        "@types/pg": "^8.15.6",
+        "pg-mem": "^3.0.12",
         "ts-node": "^10.9.2",
         "typescript": "^5.9.3"
     }

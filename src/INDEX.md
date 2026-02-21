@@ -10,7 +10,7 @@
   list/read operations.
 - `runtime.ts`: runtime bootstrap wiring for production REC source with
   fail-closed source configuration.
-- `store.ts`: sidecar persistence interface plus in-memory/SQLite durable
+- `store.ts`: sidecar persistence interface plus in-memory/Postgres durable
   implementations.
 - `freshness.ts`: freshness/executability state evaluation.
 - `indexer.service.ts`: indexing core with generation-bound watermark logic.

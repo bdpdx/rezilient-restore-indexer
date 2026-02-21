@@ -1,4 +1,4 @@
-import { DatabaseSync } from 'node:sqlite';
+import { Pool, type PoolClient, type PoolConfig } from 'pg';
 import type {
     BackfillRunState,
     IndexedEventRecord,
@@ -244,10 +244,10 @@ export class InMemoryRestoreIndexStore implements RestoreIndexStore {
     }
 }
 
-interface SnapshotRow {
-    state_json: string;
+type SnapshotRow = {
+    state_json: unknown;
     version: number;
-}
+};
 
 type RestoreIndexSnapshot = {
     backfill_runs: Record<string, BackfillRunState>;
@@ -257,40 +257,15 @@ type RestoreIndexSnapshot = {
     source_progress_by_key: Record<string, SourceProgressState>;
 };
 
-const CREATE_TABLE_SQL = `
-CREATE TABLE IF NOT EXISTS rri_state_snapshots (
-    snapshot_id INTEGER PRIMARY KEY CHECK (snapshot_id = 1),
-    version INTEGER NOT NULL,
-    state_json TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-)
-`;
+export type PostgresRestoreIndexStoreOptions = {
+    pool?: Pool;
+    poolConfig?: Omit<PoolConfig, 'connectionString'>;
+    schemaName?: string;
+    tableName?: string;
+};
 
-const SELECT_SNAPSHOT_SQL = `
-SELECT version, state_json
-FROM rri_state_snapshots
-WHERE snapshot_id = 1
-`;
-
-const INSERT_SNAPSHOT_SQL = `
-INSERT INTO rri_state_snapshots (
-    snapshot_id,
-    version,
-    state_json,
-    updated_at
-) VALUES (
-    1,
-    ?,
-    ?,
-    ?
-)
-`;
-
-const UPDATE_SNAPSHOT_SQL = `
-UPDATE rri_state_snapshots
-SET version = ?, state_json = ?, updated_at = ?
-WHERE snapshot_id = 1
-`;
+const DEFAULT_SNAPSHOT_SCHEMA = 'public';
+const DEFAULT_SNAPSHOT_TABLE = 'rri_state_snapshots';
 
 function createEmptySnapshot(): RestoreIndexSnapshot {
     return {
@@ -306,8 +281,12 @@ function serializeSnapshot(snapshot: RestoreIndexSnapshot): string {
     return JSON.stringify(snapshot);
 }
 
-function parseSnapshot(stateJson: string): RestoreIndexSnapshot {
-    const parsed = JSON.parse(stateJson) as unknown;
+function parseSnapshot(raw: unknown): RestoreIndexSnapshot {
+    let parsed: unknown = raw;
+
+    if (typeof raw === 'string') {
+        parsed = JSON.parse(raw) as unknown;
+    }
 
     if (!parsed || typeof parsed !== 'object') {
         throw new Error('invalid persisted restore-index snapshot payload');
@@ -366,22 +345,84 @@ function parseSnapshot(stateJson: string): RestoreIndexSnapshot {
     });
 }
 
-export class SqliteRestoreIndexStore implements RestoreIndexStore {
-    private readonly database: DatabaseSync;
+function validateSqlIdentifier(
+    value: string,
+    field: string,
+): string {
+    const trimmed = String(value || '').trim();
+
+    if (!trimmed) {
+        throw new Error(`${field} must not be empty`);
+    }
+
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(trimmed)) {
+        throw new Error(
+            `${field} must use [A-Za-z_][A-Za-z0-9_]* identifier format`,
+        );
+    }
+
+    return trimmed;
+}
+
+export class PostgresRestoreIndexStore implements RestoreIndexStore {
+    private readonly ownsPool: boolean;
+
+    private readonly pool: Pool;
+
+    private readonly ready: Promise<void>;
+
+    private readonly snapshotTableQualified: string;
 
     private snapshot: RestoreIndexSnapshot = createEmptySnapshot();
 
-    constructor(private readonly dbPath: string) {
-        this.database = new DatabaseSync(dbPath);
-        this.database.exec('PRAGMA journal_mode = WAL');
-        this.database.exec('PRAGMA synchronous = NORMAL');
-        this.database.exec(CREATE_TABLE_SQL);
-        this.ensureSnapshotRow();
-        this.snapshot = this.readSnapshot();
+    constructor(
+        pgUrl: string,
+        options: PostgresRestoreIndexStoreOptions = {},
+    ) {
+        const connectionString = String(pgUrl || '').trim();
+
+        if (!connectionString && !options.pool) {
+            throw new Error('REZ_RESTORE_PG_URL is required');
+        }
+
+        const schemaName = validateSqlIdentifier(
+            options.schemaName || DEFAULT_SNAPSHOT_SCHEMA,
+            'snapshot schema name',
+        );
+        const tableName = validateSqlIdentifier(
+            options.tableName || DEFAULT_SNAPSHOT_TABLE,
+            'snapshot table name',
+        );
+
+        this.snapshotTableQualified = `"${schemaName}"."${tableName}"`;
+
+        if (options.pool) {
+            this.pool = options.pool;
+            this.ownsPool = false;
+        } else {
+            this.pool = new Pool({
+                allowExitOnIdle: true,
+                connectionString,
+                idleTimeoutMillis: options.poolConfig?.idleTimeoutMillis ?? 30000,
+                max: options.poolConfig?.max ?? 10,
+                ...options.poolConfig,
+            });
+            this.ownsPool = true;
+        }
+
+        this.ready = this.initialize();
     }
 
     getIndexedEventCount(): number {
         return Object.keys(this.snapshot.indexed_events_by_key).length;
+    }
+
+    async close(): Promise<void> {
+        if (!this.ownsPool) {
+            return;
+        }
+
+        await this.pool.end();
     }
 
     async upsertIndexedEvent(
@@ -403,6 +444,8 @@ export class SqliteRestoreIndexStore implements RestoreIndexStore {
     async getPartitionWatermark(
         scope: PartitionScope,
     ): Promise<PartitionWatermarkState | null> {
+        await this.ensureReady();
+
         const state = this.snapshot.partition_watermarks_by_key[
             partitionKey(scope)
         ];
@@ -411,7 +454,7 @@ export class SqliteRestoreIndexStore implements RestoreIndexStore {
     }
 
     async putPartitionWatermark(state: PartitionWatermarkState): Promise<void> {
-        this.mutateSnapshot((snapshot) => {
+        await this.mutateSnapshot((snapshot) => {
             snapshot.partition_watermarks_by_key[
                 partitionKey({
                     instanceId: state.instanceId,
@@ -457,6 +500,8 @@ export class SqliteRestoreIndexStore implements RestoreIndexStore {
         instanceId: string,
         source: string,
     ): Promise<SourceCoverageState | null> {
+        await this.ensureReady();
+
         const state = this.snapshot.source_coverage_by_key[
             sourceKey(tenantId, instanceId, source)
         ];
@@ -465,7 +510,7 @@ export class SqliteRestoreIndexStore implements RestoreIndexStore {
     }
 
     async putSourceProgress(state: SourceProgressState): Promise<void> {
-        this.mutateSnapshot((snapshot) => {
+        await this.mutateSnapshot((snapshot) => {
             snapshot.source_progress_by_key[
                 sourceKey(state.tenantId, state.instanceId, state.source)
             ] = cloneState(state);
@@ -477,6 +522,8 @@ export class SqliteRestoreIndexStore implements RestoreIndexStore {
         instanceId: string,
         source: string,
     ): Promise<SourceProgressState | null> {
+        await this.ensureReady();
+
         const state = this.snapshot.source_progress_by_key[
             sourceKey(tenantId, instanceId, source)
         ];
@@ -485,95 +532,163 @@ export class SqliteRestoreIndexStore implements RestoreIndexStore {
     }
 
     async upsertBackfillRun(state: BackfillRunState): Promise<void> {
-        this.mutateSnapshot((snapshot) => {
+        await this.mutateSnapshot((snapshot) => {
             snapshot.backfill_runs[state.runId] = cloneState(state);
         });
     }
 
     async getBackfillRun(runId: string): Promise<BackfillRunState | null> {
+        await this.ensureReady();
+
         const state = this.snapshot.backfill_runs[runId];
 
         return state ? cloneState(state) : null;
     }
 
-    private mutateSnapshot<T>(
+    private async ensureReady(): Promise<void> {
+        await this.ready;
+    }
+
+    private async initialize(): Promise<void> {
+        await this.pool.query(this.createTableSql());
+        await this.pool.query(
+            `INSERT INTO ${this.snapshotTableQualified} (
+                snapshot_id,
+                version,
+                state_json,
+                updated_at
+            )
+            SELECT
+                1,
+                $1::bigint,
+                $2::jsonb,
+                now()
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM ${this.snapshotTableQualified}
+                WHERE snapshot_id = 1
+            )`,
+            [
+                0,
+                serializeSnapshot(createEmptySnapshot()),
+            ],
+        );
+
+        const row = await this.selectSnapshot();
+
+        if (!row) {
+            throw new Error('failed to load restore-index snapshot state');
+        }
+
+        this.snapshot = parseSnapshot(row.state_json);
+    }
+
+    private async mutateSnapshot<T>(
         mutator: (snapshot: RestoreIndexSnapshot) => T,
-    ): T {
-        this.database.exec('BEGIN IMMEDIATE');
+    ): Promise<T> {
+        await this.ensureReady();
+
+        const client = await this.pool.connect();
 
         try {
-            const row = this.selectSnapshotForTransaction();
+            await client.query('BEGIN');
+
+            const row = await this.selectSnapshotForTransaction(client);
             const working = parseSnapshot(row.state_json);
             const result = mutator(working);
             const nextVersion = row.version + 1;
-            const updateStatement = this.database.prepare(UPDATE_SNAPSHOT_SQL);
 
-            updateStatement.run(
-                nextVersion,
-                serializeSnapshot(working),
-                new Date().toISOString(),
+            await client.query(
+                `UPDATE ${this.snapshotTableQualified}
+                SET version = $1::bigint,
+                    state_json = $2::jsonb,
+                    updated_at = now()
+                WHERE snapshot_id = 1`,
+                [
+                    nextVersion,
+                    serializeSnapshot(working),
+                ],
             );
-            this.database.exec('COMMIT');
-            this.snapshot = working;
+
+            await client.query('COMMIT');
+
+            this.snapshot = cloneState(working);
 
             return result;
         } catch (error) {
-            this.database.exec('ROLLBACK');
+            await client.query('ROLLBACK');
             throw error;
+        } finally {
+            client.release();
         }
     }
 
-    private ensureSnapshotRow(): void {
-        const row = this.selectSnapshot();
-
-        if (row) {
-            return;
-        }
-
-        const insert = this.database.prepare(INSERT_SNAPSHOT_SQL);
-
-        insert.run(
-            0,
-            serializeSnapshot(createEmptySnapshot()),
-            new Date().toISOString(),
+    private async selectSnapshot(): Promise<SnapshotRow | null> {
+        const result = await this.pool.query<SnapshotRow>(
+            `SELECT version, state_json
+            FROM ${this.snapshotTableQualified}
+            WHERE snapshot_id = 1
+            ORDER BY version DESC
+            LIMIT 1`,
         );
-    }
 
-    private readSnapshot(): RestoreIndexSnapshot {
-        const row = this.selectSnapshot();
-
-        if (!row) {
-            return createEmptySnapshot();
+        if (result.rowCount !== 1) {
+            return null;
         }
 
-        return parseSnapshot(row.state_json);
+        return result.rows[0];
     }
 
-    private selectSnapshot(): SnapshotRow | undefined {
-        const statement = this.database.prepare(SELECT_SNAPSHOT_SQL);
+    private async selectSnapshotForTransaction(
+        client: PoolClient,
+    ): Promise<SnapshotRow> {
+        const result = await client.query<SnapshotRow>(
+            `SELECT version, state_json
+            FROM ${this.snapshotTableQualified}
+            WHERE snapshot_id = 1
+            ORDER BY version DESC
+            LIMIT 1
+            FOR UPDATE`,
+        );
 
-        return statement.get() as SnapshotRow | undefined;
-    }
-
-    private selectSnapshotForTransaction(): SnapshotRow {
-        const row = this.selectSnapshot();
-
-        if (row) {
-            return row;
+        if (result.rowCount === 1) {
+            return result.rows[0];
         }
 
         const emptySnapshot = createEmptySnapshot();
-        const insert = this.database.prepare(INSERT_SNAPSHOT_SQL);
 
-        insert.run(
-            0,
-            serializeSnapshot(emptySnapshot),
-            new Date().toISOString(),
+        await client.query(
+            `INSERT INTO ${this.snapshotTableQualified} (
+                snapshot_id,
+                version,
+                state_json,
+                updated_at
+            ) VALUES (
+                1,
+                $1::bigint,
+                $2::jsonb,
+                now()
+            )`,
+            [
+                0,
+                serializeSnapshot(emptySnapshot),
+            ],
         );
 
         return {
             state_json: serializeSnapshot(emptySnapshot),
             version: 0,
         };
+    }
+
+    private createTableSql(): string {
+        return `
+CREATE TABLE IF NOT EXISTS ${this.snapshotTableQualified} (
+    snapshot_id INTEGER,
+    version BIGINT,
+    state_json JSONB,
+    updated_at TIMESTAMPTZ
+)
+`;
     }
 }

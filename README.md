@@ -4,8 +4,8 @@ Restore index sidecar for RS-06.
 
 Current stage behavior:
 - Ingests normalized REC artifact metadata.
-- Persists allowlisted index rows and runtime state in durable SQLite
-  snapshots.
+- Persists allowlisted index rows and runtime state in durable Postgres
+  snapshots (`REZ_RESTORE_PG_URL`).
 - Maintains generation-bound partition watermarks.
 - Reports source coverage windows.
 - Tracks per-source progress checkpoints for restart-safe cursor resume.

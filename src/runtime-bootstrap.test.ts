@@ -1,6 +1,4 @@
 import assert from 'node:assert/strict';
-import { tmpdir } from 'node:os';
-import path from 'node:path';
 import { test } from 'node:test';
 import { createRuntime } from './runtime';
 import { InMemoryRestoreIndexStore } from './store';
@@ -77,28 +75,20 @@ class SingleBatchObjectStoreClient implements RecManifestObjectStoreClient {
     }
 }
 
-function buildStateDbPath(
-    suffix: string,
-): string {
-    return path.join(
-        tmpdir(),
-        `rri-runtime-bootstrap-${process.pid}-${suffix}.sqlite`,
-    );
-}
-
 function buildRecModeEnv(
     overrides: Record<string, string> = {},
 ): NodeJS.ProcessEnv {
     return {
         REZ_RESTORE_INDEXER_ARTIFACT_SOURCE: 'rec_manifest_object_store',
         REZ_RESTORE_INDEXER_DEFAULT_TENANT: 'tenant-acme',
+        REZ_RESTORE_PG_URL:
+            'postgres://rez_restore_indexer_rw:test@127.0.0.1:5432/rez_restore',
         REZ_RESTORE_INDEXER_SOURCE_BUCKET: 'rez-artifacts',
         REZ_RESTORE_INDEXER_SOURCE_GENERATION_ID: 'gen-runtime-01',
         REZ_RESTORE_INDEXER_SOURCE_INSTANCE_ID: 'sn-dev-01',
         REZ_RESTORE_INDEXER_SOURCE_PREFIX: 'rez/restore-artifacts',
         REZ_RESTORE_INDEXER_SOURCE_REGION: 'us-east-1',
         REZ_RESTORE_INDEXER_SOURCE_URI: 'sn://acme-dev.service-now.com',
-        REZ_RESTORE_INDEXER_STATE_DB_PATH: buildStateDbPath('rec'),
         ...overrides,
     };
 }
@@ -128,11 +118,25 @@ test('runtime bootstrap fails closed when required source config is missing',
     }, /REZ_RESTORE_INDEXER_SOURCE_BUCKET is required/);
 });
 
+test('runtime bootstrap fails closed when restore Postgres DSN is missing',
+() => {
+    const env = buildRecModeEnv();
+
+    delete env.REZ_RESTORE_PG_URL;
+
+    assert.throws(() => {
+        createRuntime(env, {
+            createStore: () => new InMemoryRestoreIndexStore(),
+        });
+    }, /REZ_RESTORE_PG_URL is required/);
+});
+
 test('runtime bootstrap supports deliberate in-memory scaffold mode',
 async () => {
     const runtime = createRuntime({
         REZ_RESTORE_INDEXER_ARTIFACT_SOURCE: 'in_memory_scaffold',
-        REZ_RESTORE_INDEXER_STATE_DB_PATH: buildStateDbPath('scaffold'),
+        REZ_RESTORE_PG_URL:
+            'postgres://rez_restore_indexer_rw:test@127.0.0.1:5432/rez_restore',
     }, {
         createStore: () => new InMemoryRestoreIndexStore(),
     });

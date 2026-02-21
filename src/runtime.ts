@@ -8,7 +8,7 @@ import {
     type RecManifestObjectStoreClient,
 } from './rec-manifest-source';
 import {
-    SqliteRestoreIndexStore,
+    PostgresRestoreIndexStore,
     type RestoreIndexStore,
 } from './store';
 import {
@@ -38,7 +38,7 @@ export type RuntimeDependencyOverrides = {
     createObjectStoreClient?: (
         source: RecManifestObjectStoreSourceEnv,
     ) => RecManifestObjectStoreClient;
-    createStore?: (stateDbPath: string) => RestoreIndexStore;
+    createStore?: (restorePgUrl: string) => RestoreIndexStore;
 };
 
 function createRecSource(
@@ -86,10 +86,10 @@ export function createRuntime(
 ): RuntimeBootstrap {
     const config = parseIndexerEnv(env);
     const createStore = dependencies.createStore
-        || ((stateDbPath: string) => {
-            return new SqliteRestoreIndexStore(stateDbPath);
+        || ((restorePgUrl: string) => {
+            return new PostgresRestoreIndexStore(restorePgUrl);
         });
-    const store = createStore(config.stateDbPath);
+    const store = createStore(config.restorePgUrl);
     const indexer = new RestoreIndexerService(store, {
         freshnessPolicy: {
             staleAfterSeconds: config.staleAfterSeconds,

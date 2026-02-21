@@ -12,7 +12,7 @@ Entrypoints:
 - `src/freshness.ts`: strict fail-closed freshness gate evaluation.
 - `src/backfill.ts`: bootstrap and gap-repair orchestration with lag guardrails.
 - `src/store.ts`: restore index persistence interfaces plus in-memory and
-  SQLite-backed durable state stores.
+  Postgres-backed durable state stores.
 - `src/worker.ts`: cursor-aware batch worker with continuous polling loop and
   persisted source progress checkpoints.
 - `src/rec-manifest-source.ts`: production REC manifest object-store source
