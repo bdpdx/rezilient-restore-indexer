@@ -110,3 +110,150 @@ test('worker keeps cursor pinned when a batch includes failures', async () => {
     assert.equal(recovered.cursor, '2');
     assert.equal(store.getIndexedEventCount(), 2);
 });
+
+test('worker processes batches only while holding source leader lease',
+async () => {
+    const store = new InMemoryRestoreIndexStore();
+    const scope = {
+        instanceId: 'sn-dev-01',
+        source: 'sn://acme-dev.service-now.com',
+        tenantId: 'tenant-acme',
+    };
+    const indexer = new RestoreIndexerService(store, {
+        freshnessPolicy: {
+            staleAfterSeconds: 120,
+            timeoutSeconds: 60,
+        },
+    });
+    const workerA = new RestoreIndexerWorker(
+        new InMemoryArtifactBatchSource([
+            buildTestInput({
+                eventId: 'evt-worker-lease-a',
+                offset: 1,
+            }),
+        ]),
+        indexer,
+        10,
+        {
+            leaderLease: {
+                holderId: 'holder-a',
+                leaseDurationSeconds: 30,
+                manager: store,
+            },
+            sourceProgressScope: scope,
+        },
+    );
+    const workerB = new RestoreIndexerWorker(
+        new InMemoryArtifactBatchSource([
+            buildTestInput({
+                eventId: 'evt-worker-lease-a',
+                offset: 1,
+            }),
+            buildTestInput({
+                eventId: 'evt-worker-lease-b',
+                offset: 2,
+            }),
+        ]),
+        indexer,
+        10,
+        {
+            leaderLease: {
+                holderId: 'holder-b',
+                leaseDurationSeconds: 30,
+                manager: store,
+            },
+            sourceProgressScope: scope,
+        },
+    );
+
+    const first = await workerA.runOnce();
+
+    assert.equal(first.batchSize, 1);
+    assert.equal(first.inserted, 1);
+
+    const blocked = await workerB.runOnce();
+
+    assert.equal(blocked.batchSize, 0);
+    assert.equal(blocked.inserted, 0);
+
+    await store.releaseSourceLeaderLease({
+        holderId: 'holder-a',
+        instanceId: scope.instanceId,
+        source: scope.source,
+        tenantId: scope.tenantId,
+    });
+
+    const recovered = await workerB.runOnce();
+
+    assert.equal(recovered.batchSize, 1);
+    assert.equal(recovered.inserted, 1);
+    assert.equal(store.getIndexedEventCount(), 2);
+});
+
+test('continuous worker run releases source leader lease on shutdown',
+async () => {
+    const store = new InMemoryRestoreIndexStore();
+    const scope = {
+        instanceId: 'sn-dev-01',
+        source: 'sn://acme-dev.service-now.com',
+        tenantId: 'tenant-acme',
+    };
+    const indexer = new RestoreIndexerService(store, {
+        freshnessPolicy: {
+            staleAfterSeconds: 120,
+            timeoutSeconds: 60,
+        },
+    });
+    const workerA = new RestoreIndexerWorker(
+        new InMemoryArtifactBatchSource([
+            buildTestInput({
+                eventId: 'evt-worker-release-a',
+                offset: 1,
+            }),
+        ]),
+        indexer,
+        10,
+        {
+            leaderLease: {
+                holderId: 'holder-a',
+                leaseDurationSeconds: 30,
+                manager: store,
+            },
+            sourceProgressScope: scope,
+        },
+    );
+
+    const summary = await workerA.runContinuously({
+        maxCycles: 1,
+    });
+
+    assert.equal(summary.inserted, 1);
+
+    const workerB = new RestoreIndexerWorker(
+        new InMemoryArtifactBatchSource([
+            buildTestInput({
+                eventId: 'evt-worker-release-a',
+                offset: 1,
+            }),
+            buildTestInput({
+                eventId: 'evt-worker-release-b',
+                offset: 2,
+            }),
+        ]),
+        indexer,
+        10,
+        {
+            leaderLease: {
+                holderId: 'holder-b',
+                leaseDurationSeconds: 30,
+                manager: store,
+            },
+            sourceProgressScope: scope,
+        },
+    );
+
+    const recovered = await workerB.runOnce();
+
+    assert.equal(recovered.batchSize, 1);
+    assert.equal(recovered.inserted, 1);
+});

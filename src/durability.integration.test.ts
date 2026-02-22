@@ -336,3 +336,53 @@ async () => {
         }
     }
 });
+
+test('postgres store source leader lease enforces single active holder',
+async () => {
+    const db = newDb();
+    const fixture = createFixture(db);
+    const scope = {
+        instanceId: 'sn-dev-01',
+        source: 'sn://acme-dev.service-now.com',
+        tenantId: 'tenant-acme',
+    };
+
+    try {
+        const first = await fixture.store.acquireSourceLeaderLease({
+            holderId: 'holder-a',
+            instanceId: scope.instanceId,
+            leaseDurationSeconds: 30,
+            source: scope.source,
+            tenantId: scope.tenantId,
+        });
+        const second = await fixture.store.acquireSourceLeaderLease({
+            holderId: 'holder-b',
+            instanceId: scope.instanceId,
+            leaseDurationSeconds: 30,
+            source: scope.source,
+            tenantId: scope.tenantId,
+        });
+
+        assert.equal(first, true);
+        assert.equal(second, false);
+
+        await fixture.store.releaseSourceLeaderLease({
+            holderId: 'holder-a',
+            instanceId: scope.instanceId,
+            source: scope.source,
+            tenantId: scope.tenantId,
+        });
+
+        const recovered = await fixture.store.acquireSourceLeaderLease({
+            holderId: 'holder-b',
+            instanceId: scope.instanceId,
+            leaseDurationSeconds: 30,
+            source: scope.source,
+            tenantId: scope.tenantId,
+        });
+
+        assert.equal(recovered, true);
+    } finally {
+        await fixture.close();
+    }
+});

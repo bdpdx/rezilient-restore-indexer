@@ -26,6 +26,9 @@ async function main(): Promise<void> {
         artifact_source: source.mode,
         backfill_batch_size: config.backfillBatchSize,
         default_tenant: config.defaultTenant,
+        leader_election_enabled: config.leaderLease.enabled,
+        leader_id: config.leaderLease.holderId || null,
+        leader_lease_seconds: config.leaderLease.leaseDurationSeconds,
         object_store_bucket: source.mode === 'rec_manifest_object_store'
             ? source.bucket
             : null,

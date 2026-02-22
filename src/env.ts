@@ -29,6 +29,11 @@ export type RestoreIndexerEnv = {
     batchSize: number;
     defaultTenant: string;
     freshnessTimeoutSeconds: number;
+    leaderLease: {
+        enabled: boolean;
+        holderId?: string;
+        leaseDurationSeconds: number;
+    };
     pollIntervalMs: number;
     recManifestSource?: RecManifestObjectStoreSourceEnv;
     restorePgUrl: string;
@@ -176,6 +181,18 @@ export function parseIndexerEnv(
     const artifactSourceMode = parseArtifactSourceMode(
         env.REZ_RESTORE_INDEXER_ARTIFACT_SOURCE,
     );
+    const leaderElectionEnabled = parseBoolean(
+        env.REZ_RESTORE_INDEXER_LEADER_ELECTION_ENABLED,
+        artifactSourceMode === 'rec_manifest_object_store',
+        'REZ_RESTORE_INDEXER_LEADER_ELECTION_ENABLED',
+    );
+    const leaderLeaseDurationSeconds = parsePositiveInt(
+        env.REZ_RESTORE_INDEXER_LEADER_LEASE_SECONDS,
+        30,
+    );
+    const leaderId = readOptionalString(
+        env.REZ_RESTORE_INDEXER_LEADER_ID,
+    );
     let recManifestSource: RecManifestObjectStoreSourceEnv | undefined;
 
     if (artifactSourceMode === 'rec_manifest_object_store') {
@@ -259,6 +276,16 @@ export function parseIndexerEnv(
         };
     }
 
+    if (
+        leaderElectionEnabled
+        && artifactSourceMode !== 'rec_manifest_object_store'
+    ) {
+        throw new Error(
+            'REZ_RESTORE_INDEXER_LEADER_ELECTION_ENABLED=true requires '
+            + 'REZ_RESTORE_INDEXER_ARTIFACT_SOURCE=rec_manifest_object_store',
+        );
+    }
+
     return {
         artifactSourceMode,
         backfillBatchSize: parsePositiveInt(
@@ -278,6 +305,11 @@ export function parseIndexerEnv(
             env.REZ_RESTORE_INDEXER_FRESHNESS_TIMEOUT_SECONDS,
             60,
         ),
+        leaderLease: {
+            enabled: leaderElectionEnabled,
+            holderId: leaderId,
+            leaseDurationSeconds: leaderLeaseDurationSeconds,
+        },
         pollIntervalMs: parsePositiveInt(
             env.REZ_RESTORE_INDEXER_POLL_INTERVAL_MS,
             1000,

@@ -15,9 +15,11 @@ Entrypoints:
 - `src/store.ts`: restore index persistence interfaces plus in-memory and
   Postgres-backed durable state stores for restore-plane tables
   (`index_events`, `partition_watermarks`, `partition_generations`,
-  `source_coverage`, `backfill_runs`, `source_progress`).
+  `source_coverage`, `backfill_runs`, `source_progress`,
+  `source_leader_leases`).
 - `src/worker.ts`: cursor-aware batch worker with continuous polling loop,
-  fail-closed cursor advancement, and persisted source progress checkpoints.
+  fail-closed cursor advancement, source-scope leader lease gating, and
+  persisted source progress checkpoints.
 - `src/rec-manifest-source.ts`: production REC manifest object-store source
   adapter with retrying reads, deterministic key cursoring, and manifest-page
   scanning that avoids empty-page starvation.

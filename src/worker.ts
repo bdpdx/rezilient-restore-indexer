@@ -18,10 +18,32 @@ export interface ArtifactBatchSource {
     }): Promise<ArtifactBatch>;
 }
 
+export interface SourceLeaderLeaseManager {
+    acquireSourceLeaderLease(input: {
+        holderId: string;
+        instanceId: string;
+        leaseDurationSeconds: number;
+        source: string;
+        tenantId: string;
+    }): Promise<boolean>;
+    releaseSourceLeaderLease(input: {
+        holderId: string;
+        instanceId: string;
+        source: string;
+        tenantId: string;
+    }): Promise<void>;
+}
+
 export type SourceProgressScope = {
     instanceId: string;
     source: string;
     tenantId: string;
+};
+
+export type SourceLeaderLeaseOptions = {
+    holderId: string;
+    leaseDurationSeconds: number;
+    manager: SourceLeaderLeaseManager;
 };
 
 export type WorkerRunSummary = ProcessBatchResult & {
@@ -43,6 +65,7 @@ export type WorkerContinuousOptions = {
 };
 
 export type RestoreIndexerWorkerOptions = {
+    leaderLease?: SourceLeaderLeaseOptions;
     pollIntervalMs?: number;
     sleep?: (ms: number) => Promise<void>;
     sourceProgressScope?: SourceProgressScope;
@@ -159,9 +182,13 @@ export class RestoreIndexerWorker {
 
     private readonly sleep: (ms: number) => Promise<void>;
 
+    private readonly leaderLease?: SourceLeaderLeaseOptions;
+
     private readonly sourceProgressScope?: SourceProgressScope;
 
     private readonly timeProvider: () => string;
+
+    private isLeader = false;
 
     constructor(
         private readonly source: ArtifactBatchSource,
@@ -172,8 +199,15 @@ export class RestoreIndexerWorker {
         this.pollIntervalMs = options.pollIntervalMs
             ?? DEFAULT_POLL_INTERVAL_MS;
         this.sleep = options.sleep ?? sleepMs;
+        this.leaderLease = options.leaderLease;
         this.sourceProgressScope = options.sourceProgressScope;
         this.timeProvider = options.timeProvider ?? nowIso;
+
+        if (this.leaderLease && !this.sourceProgressScope) {
+            throw new Error(
+                'leader lease requires sourceProgressScope to be configured',
+            );
+        }
     }
 
     pause(): void {
@@ -190,6 +224,19 @@ export class RestoreIndexerWorker {
 
     async runOnce(): Promise<WorkerRunSummary> {
         if (this.paused) {
+            return {
+                batchSize: 0,
+                cursor: this.cursor,
+                existing: 0,
+                failures: 0,
+                inserted: 0,
+                realtimeLagSeconds: null,
+            };
+        }
+
+        const hasLeadership = await this.ensureLeadership();
+
+        if (!hasLeadership) {
             return {
                 batchSize: 0,
                 cursor: this.cursor,
@@ -238,35 +285,96 @@ export class RestoreIndexerWorker {
             inserted: 0,
         };
 
-        while (!this.stopRequested) {
-            const run = await this.runOnce();
+        try {
+            while (!this.stopRequested) {
+                const run = await this.runOnce();
 
-            summary.cycles += 1;
-            summary.inserted += run.inserted;
-            summary.existing += run.existing;
-            summary.failures += run.failures;
+                summary.cycles += 1;
+                summary.inserted += run.inserted;
+                summary.existing += run.existing;
+                summary.failures += run.failures;
 
-            if (run.batchSize === 0) {
-                summary.emptyBatches += 1;
+                if (run.batchSize === 0) {
+                    summary.emptyBatches += 1;
+                }
+
+                if (
+                    options.maxCycles !== undefined
+                    && summary.cycles >= options.maxCycles
+                ) {
+                    break;
+                }
+
+                if (this.stopRequested) {
+                    break;
+                }
+
+                if (run.batchSize === 0) {
+                    await this.sleep(this.pollIntervalMs);
+                }
             }
-
-            if (
-                options.maxCycles !== undefined
-                && summary.cycles >= options.maxCycles
-            ) {
-                break;
-            }
-
-            if (this.stopRequested) {
-                break;
-            }
-
-            if (run.batchSize === 0) {
-                await this.sleep(this.pollIntervalMs);
-            }
+        } finally {
+            await this.releaseLeadership();
         }
 
         return summary;
+    }
+
+    private async ensureLeadership(): Promise<boolean> {
+        if (!this.leaderLease || !this.sourceProgressScope) {
+            return true;
+        }
+
+        const acquired = await this.leaderLease.manager.acquireSourceLeaderLease({
+            holderId: this.leaderLease.holderId,
+            instanceId: this.sourceProgressScope.instanceId,
+            leaseDurationSeconds: this.leaderLease.leaseDurationSeconds,
+            source: this.sourceProgressScope.source,
+            tenantId: this.sourceProgressScope.tenantId,
+        });
+
+        if (acquired !== this.isLeader) {
+            const message = acquired
+                ? 'restore-indexer leader lease acquired'
+                : 'restore-indexer leader lease unavailable';
+
+            console.log(message, {
+                holder_id: this.leaderLease.holderId,
+                instance_id: this.sourceProgressScope.instanceId,
+                source: this.sourceProgressScope.source,
+                tenant_id: this.sourceProgressScope.tenantId,
+            });
+        }
+
+        this.isLeader = acquired;
+
+        return acquired;
+    }
+
+    private async releaseLeadership(): Promise<void> {
+        if (
+            !this.leaderLease
+            || !this.sourceProgressScope
+            || !this.isLeader
+        ) {
+            return;
+        }
+
+        this.isLeader = false;
+
+        try {
+            await this.leaderLease.manager.releaseSourceLeaderLease({
+                holderId: this.leaderLease.holderId,
+                instanceId: this.sourceProgressScope.instanceId,
+                source: this.sourceProgressScope.source,
+                tenantId: this.sourceProgressScope.tenantId,
+            });
+        } catch (error: unknown) {
+            console.error(
+                'restore-indexer leader lease release failed',
+                error,
+            );
+        }
     }
 
     private async loadCursorIfNeeded(): Promise<void> {

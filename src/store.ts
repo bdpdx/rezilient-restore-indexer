@@ -100,6 +100,13 @@ function recomputeCoverageFromWatermarks(
 }
 
 export interface RestoreIndexStore {
+    acquireSourceLeaderLease(input: {
+        holderId: string;
+        instanceId: string;
+        leaseDurationSeconds: number;
+        source: string;
+        tenantId: string;
+    }): Promise<boolean>;
     getBackfillRun(runId: string): Promise<BackfillRunState | null>;
     getIndexedEventCount(): number;
     getPartitionWatermark(
@@ -123,6 +130,12 @@ export interface RestoreIndexStore {
         source: string;
         tenantId: string;
     }): Promise<SourceCoverageState | null>;
+    releaseSourceLeaderLease(input: {
+        holderId: string;
+        instanceId: string;
+        source: string;
+        tenantId: string;
+    }): Promise<void>;
     upsertBackfillRun(state: BackfillRunState): Promise<void>;
     upsertIndexedEvent(
         record: IndexedEventRecord,
@@ -141,8 +154,69 @@ export class InMemoryRestoreIndexStore implements RestoreIndexStore {
 
     private readonly sourceProgress = new Map<string, SourceProgressState>();
 
+    private readonly sourceLeaderLeases = new Map<string, {
+        holderId: string;
+        leaseExpiresAtMs: number;
+    }>();
+
     getIndexedEventCount(): number {
         return this.indexedEvents.size;
+    }
+
+    async acquireSourceLeaderLease(input: {
+        holderId: string;
+        instanceId: string;
+        leaseDurationSeconds: number;
+        source: string;
+        tenantId: string;
+    }): Promise<boolean> {
+        const key = sourceKey(
+            input.tenantId,
+            input.instanceId,
+            input.source,
+        );
+        const existing = this.sourceLeaderLeases.get(key);
+        const nowMs = Date.now();
+
+        if (
+            existing
+            && existing.holderId !== input.holderId
+            && existing.leaseExpiresAtMs > nowMs
+        ) {
+            return false;
+        }
+
+        const leaseDurationSeconds = Math.max(
+            1,
+            Math.floor(input.leaseDurationSeconds),
+        );
+
+        this.sourceLeaderLeases.set(key, {
+            holderId: input.holderId,
+            leaseExpiresAtMs: nowMs + (leaseDurationSeconds * 1000),
+        });
+
+        return true;
+    }
+
+    async releaseSourceLeaderLease(input: {
+        holderId: string;
+        instanceId: string;
+        source: string;
+        tenantId: string;
+    }): Promise<void> {
+        const key = sourceKey(
+            input.tenantId,
+            input.instanceId,
+            input.source,
+        );
+        const existing = this.sourceLeaderLeases.get(key);
+
+        if (!existing || existing.holderId !== input.holderId) {
+            return;
+        }
+
+        this.sourceLeaderLeases.delete(key);
     }
 
     async upsertIndexedEvent(
@@ -285,6 +359,11 @@ type SourceProgressRow = {
     updated_at: Date | string;
 };
 
+type SourceLeaderLeaseRow = {
+    holder_id: string;
+    lease_expires_at: Date | string;
+};
+
 type BackfillRunRow = {
     last_cursor: string | null;
     max_realtime_lag_seconds: number;
@@ -301,12 +380,14 @@ export type PostgresRestoreIndexStoreOptions = {
     pool?: Pool;
     poolConfig?: Omit<PoolConfig, 'connectionString'>;
     schemaName?: string;
+    sourceLeaderLeaseTableName?: string;
     sourceProgressTableName?: string;
     tableName?: string;
 };
 
 const DEFAULT_SCHEMA = 'rez_restore_index';
 const DEFAULT_SOURCE_PROGRESS_TABLE = 'source_progress';
+const DEFAULT_SOURCE_LEADER_LEASE_TABLE = 'source_leader_leases';
 const PG_BIGINT_MAX = BigInt('9223372036854775807');
 const UNKNOWN_SCOPE = {
     instanceId: 'unknown_instance',
@@ -478,6 +559,8 @@ export class PostgresRestoreIndexStore implements RestoreIndexStore {
 
     private readonly sourceProgressTableQualified: string;
 
+    private readonly sourceLeaderLeasesTableQualified: string;
+
     private readonly backfillRunsTableQualified: string;
 
     private indexedEventCount = 0;
@@ -502,6 +585,11 @@ export class PostgresRestoreIndexStore implements RestoreIndexStore {
                 || DEFAULT_SOURCE_PROGRESS_TABLE,
             'source progress table name',
         );
+        const sourceLeaderLeaseTableName = validateSqlIdentifier(
+            options.sourceLeaderLeaseTableName
+                || DEFAULT_SOURCE_LEADER_LEASE_TABLE,
+            'source leader lease table name',
+        );
 
         this.indexEventsTableQualified = `"${this.schemaName}"."index_events"`;
         this.partitionGenerationsTableQualified =
@@ -513,6 +601,8 @@ export class PostgresRestoreIndexStore implements RestoreIndexStore {
         this.backfillRunsTableQualified = `"${this.schemaName}"."backfill_runs"`;
         this.sourceProgressTableQualified =
             `"${this.schemaName}"."${sourceProgressTableName}"`;
+        this.sourceLeaderLeasesTableQualified =
+            `"${this.schemaName}"."${sourceLeaderLeaseTableName}"`;
 
         if (options.pool) {
             this.pool = options.pool;
@@ -541,6 +631,99 @@ export class PostgresRestoreIndexStore implements RestoreIndexStore {
         }
 
         await this.pool.end();
+    }
+
+    async acquireSourceLeaderLease(input: {
+        holderId: string;
+        instanceId: string;
+        leaseDurationSeconds: number;
+        source: string;
+        tenantId: string;
+    }): Promise<boolean> {
+        await this.ensureReady();
+
+        const leaseDurationSeconds = Math.max(
+            1,
+            Math.floor(input.leaseDurationSeconds),
+        );
+        const result = await this.pool.query<SourceLeaderLeaseRow>(
+            `INSERT INTO ${this.sourceLeaderLeasesTableQualified} AS leases (
+                tenant_id,
+                instance_id,
+                source,
+                holder_id,
+                lease_expires_at,
+                created_at,
+                updated_at
+            ) VALUES (
+                $1,
+                $2,
+                $3,
+                $4,
+                now() + (($5::text || ' seconds')::interval),
+                now(),
+                now()
+            )
+            ON CONFLICT (tenant_id, instance_id, source) DO UPDATE SET
+                holder_id = CASE
+                    WHEN leases.holder_id = EXCLUDED.holder_id
+                        OR leases.lease_expires_at <= now()
+                    THEN EXCLUDED.holder_id
+                    ELSE leases.holder_id
+                END,
+                lease_expires_at = CASE
+                    WHEN leases.holder_id = EXCLUDED.holder_id
+                        OR leases.lease_expires_at <= now()
+                    THEN EXCLUDED.lease_expires_at
+                    ELSE leases.lease_expires_at
+                END,
+                updated_at = CASE
+                    WHEN leases.holder_id = EXCLUDED.holder_id
+                        OR leases.lease_expires_at <= now()
+                    THEN now()
+                    ELSE leases.updated_at
+                END
+            RETURNING
+                holder_id,
+                lease_expires_at`,
+            [
+                input.tenantId,
+                input.instanceId,
+                input.source,
+                input.holderId,
+                leaseDurationSeconds,
+            ],
+        );
+
+        if (result.rowCount !== 1) {
+            return false;
+        }
+
+        return result.rows[0].holder_id === input.holderId;
+    }
+
+    async releaseSourceLeaderLease(input: {
+        holderId: string;
+        instanceId: string;
+        source: string;
+        tenantId: string;
+    }): Promise<void> {
+        await this.ensureReady();
+        await this.pool.query(
+            `UPDATE ${this.sourceLeaderLeasesTableQualified}
+            SET lease_expires_at = now(),
+                updated_at = now()
+            WHERE tenant_id = $1
+              AND instance_id = $2
+              AND source = $3
+              AND holder_id = $4`,
+            [
+                input.tenantId,
+                input.instanceId,
+                input.source,
+                input.holderId,
+            ],
+        );
     }
 
     async upsertIndexedEvent(
@@ -1300,6 +1483,7 @@ export class PostgresRestoreIndexStore implements RestoreIndexStore {
         await this.pool.query(this.createSourceCoverageSql());
         await this.pool.query(this.createBackfillRunsSql());
         await this.pool.query(this.createSourceProgressSql());
+        await this.pool.query(this.createSourceLeaderLeasesSql());
 
         const countResult = await this.pool.query<{
             count: string;
@@ -1520,6 +1704,32 @@ ON ${this.sourceProgressTableQualified} (
     tenant_id,
     instance_id,
     source
+);
+`;
+    }
+
+    private createSourceLeaderLeasesSql(): string {
+        return `
+CREATE TABLE IF NOT EXISTS ${this.sourceLeaderLeasesTableQualified} (
+    tenant_id TEXT,
+    instance_id TEXT,
+    source TEXT,
+    holder_id TEXT,
+    lease_expires_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_source_leader_leases_scope
+ON ${this.sourceLeaderLeasesTableQualified} (
+    tenant_id,
+    instance_id,
+    source
+);
+
+CREATE INDEX IF NOT EXISTS ix_source_leader_leases_active
+ON ${this.sourceLeaderLeasesTableQualified} (
+    lease_expires_at DESC
 );
 `;
     }

@@ -13,11 +13,12 @@
   fail-closed source configuration.
 - `store.ts`: sidecar persistence interface plus in-memory/Postgres durable
   implementations aligned to restore-plane relational tables including
-  `source_progress` checkpoints.
+  `source_progress` checkpoints and source-scope leader leases.
 - `freshness.ts`: freshness/executability state evaluation.
 - `indexer.service.ts`: indexing core with generation-bound watermark logic.
 - `worker.ts`: cursor-aware source polling loop with continuous runtime
-  controls, fail-closed cursor progression, and source progress checkpointing.
+  controls, source-scope leader lease gating, fail-closed cursor progression,
+  and source progress checkpointing.
 - `backfill.ts`: bootstrap and gap-repair controller with fail-closed pause
   semantics when indexing failures occur.
 - `index.ts`: local bootstrap.

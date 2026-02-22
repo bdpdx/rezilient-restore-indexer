@@ -150,6 +150,20 @@ async () => {
     assert.equal(run.failures, 0);
 });
 
+test('runtime bootstrap fails closed when leader election is enabled for '
+    + 'scaffold source mode', () => {
+    assert.throws(() => {
+        createRuntime({
+            REZ_RESTORE_INDEXER_ARTIFACT_SOURCE: 'in_memory_scaffold',
+            REZ_RESTORE_INDEXER_LEADER_ELECTION_ENABLED: 'true',
+            REZ_RESTORE_PG_URL:
+                'postgres://rez_restore_indexer_rw:test@127.0.0.1:5432/rez_restore',
+        }, {
+            createStore: () => new InMemoryRestoreIndexStore(),
+        });
+    }, /REZ_RESTORE_INDEXER_LEADER_ELECTION_ENABLED=true requires/);
+});
+
 test('runtime bootstrap wires REC manifest source and ingests a non-empty batch',
 async () => {
     const prefix = 'rez/restore-artifacts';

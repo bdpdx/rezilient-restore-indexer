@@ -1,3 +1,4 @@
+import { hostname as resolveHostname } from 'node:os';
 import { parseIndexerEnv, type RecManifestObjectStoreSourceEnv } from './env';
 import { RestoreIndexerService } from './indexer.service';
 import {
@@ -40,6 +41,10 @@ export type RuntimeDependencyOverrides = {
     ) => RecManifestObjectStoreClient;
     createStore?: (restorePgUrl: string) => RestoreIndexStore;
 };
+
+function buildDefaultLeaderId(): string {
+    return `${resolveHostname()}:${process.pid}`;
+}
 
 function createRecSource(
     sourceConfig: RecManifestObjectStoreSourceEnv,
@@ -132,6 +137,15 @@ export function createRuntime(
             indexer,
             config.batchSize,
             {
+                leaderLease: config.leaderLease.enabled
+                    ? {
+                        holderId: config.leaderLease.holderId
+                            || buildDefaultLeaderId(),
+                        leaseDurationSeconds:
+                            config.leaderLease.leaseDurationSeconds,
+                        manager: store,
+                    }
+                    : undefined,
                 pollIntervalMs: config.pollIntervalMs,
                 sourceProgressScope: config.recManifestSource.sourceProgressScope,
             },

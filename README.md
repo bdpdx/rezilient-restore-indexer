@@ -13,6 +13,7 @@ Current stage behavior:
 - Runs bootstrap/gap-repair backfill controllers with lag guardrails.
 - Runs as a continuous worker service with graceful shutdown.
 - Uses REC manifest object-store source wiring by default at startup.
+- Uses source-scope leader lease election for active/passive failover.
 - Fails closed at startup when required source configuration is missing.
 - Supports explicit non-production scaffold mode only with
   `REZ_RESTORE_INDEXER_ARTIFACT_SOURCE=in_memory_scaffold`.
