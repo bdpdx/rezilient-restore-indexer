@@ -6,6 +6,7 @@ export type ArtifactSourceMode =
     | 'in_memory_scaffold';
 
 export type RecManifestObjectStoreSourceEnv = {
+    accessKeyId?: string;
     bucket: string;
     endpoint?: string;
     forcePathStyle: boolean;
@@ -15,7 +16,9 @@ export type RecManifestObjectStoreSourceEnv = {
     maxAttempts: number;
     region: string;
     retryBaseMs: number;
+    secretAccessKey?: string;
     sourceProgressScope: SourceProgressScope;
+    sessionToken?: string;
     tenantId: string;
 };
 
@@ -176,6 +179,27 @@ export function parseIndexerEnv(
     let recManifestSource: RecManifestObjectStoreSourceEnv | undefined;
 
     if (artifactSourceMode === 'rec_manifest_object_store') {
+        const accessKeyId = readOptionalString(
+            env.REZ_RESTORE_INDEXER_SOURCE_ACCESS_KEY_ID,
+        );
+        const secretAccessKey = readOptionalString(
+            env.REZ_RESTORE_INDEXER_SOURCE_SECRET_ACCESS_KEY,
+        );
+        const sessionToken = readOptionalString(
+            env.REZ_RESTORE_INDEXER_SOURCE_SESSION_TOKEN,
+        );
+
+        if (
+            (accessKeyId && !secretAccessKey)
+            || (!accessKeyId && secretAccessKey)
+        ) {
+            throw new Error(
+                'REZ_RESTORE_INDEXER_SOURCE_ACCESS_KEY_ID and '
+                + 'REZ_RESTORE_INDEXER_SOURCE_SECRET_ACCESS_KEY must be '
+                + 'set together when provided',
+            );
+        }
+
         const tenantId = readOptionalString(
             env.REZ_RESTORE_INDEXER_SOURCE_TENANT_ID,
         ) || defaultTenant;
@@ -192,6 +216,7 @@ export function parseIndexerEnv(
         };
 
         recManifestSource = {
+            accessKeyId,
             bucket: readRequiredString(
                 env,
                 'REZ_RESTORE_INDEXER_SOURCE_BUCKET',
@@ -227,7 +252,9 @@ export function parseIndexerEnv(
                 env.REZ_RESTORE_INDEXER_SOURCE_RETRY_BASE_MS,
                 200,
             ),
+            secretAccessKey,
             sourceProgressScope,
+            sessionToken,
             tenantId,
         };
     }

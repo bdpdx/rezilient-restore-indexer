@@ -51,10 +51,13 @@ function createRecSource(
     const objectStoreClientFactory = dependencies.createObjectStoreClient
         || ((input: RecManifestObjectStoreSourceEnv) => {
             return createS3RecManifestObjectStoreClient({
+                accessKeyId: input.accessKeyId,
                 bucket: input.bucket,
                 endpoint: input.endpoint,
                 forcePathStyle: input.forcePathStyle,
                 region: input.region,
+                secretAccessKey: input.secretAccessKey,
+                sessionToken: input.sessionToken,
             });
         });
     const objectStoreClient = objectStoreClientFactory(sourceConfig);

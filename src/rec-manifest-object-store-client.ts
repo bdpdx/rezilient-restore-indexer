@@ -9,10 +9,13 @@ import type { RecManifestObjectStoreClient } from './rec-manifest-source';
 const MANIFEST_SUFFIX = '.manifest.json';
 
 export type RecManifestS3ObjectStoreClientConfig = {
+    accessKeyId?: string;
     bucket: string;
     endpoint?: string;
     forcePathStyle?: boolean;
     region: string;
+    secretAccessKey?: string;
+    sessionToken?: string;
 };
 
 function toUtf8String(
@@ -185,6 +188,14 @@ export function createS3RecManifestObjectStoreClient(
 
     if (config.endpoint) {
         clientConfig.endpoint = config.endpoint;
+    }
+
+    if (config.accessKeyId && config.secretAccessKey) {
+        clientConfig.credentials = {
+            accessKeyId: config.accessKeyId,
+            secretAccessKey: config.secretAccessKey,
+            sessionToken: config.sessionToken,
+        };
     }
 
     const client = new S3Client(clientConfig);
