@@ -386,3 +386,67 @@ async () => {
         await fixture.close();
     }
 });
+
+test('postgres store watermark lookup ignores source filter in scope',
+async () => {
+    const db = newDb();
+    const fixture = createFixture(db);
+
+    try {
+        const worker = new RestoreIndexerWorker(
+            new InMemoryArtifactBatchSource([
+                buildTestInput({
+                    eventId: 'evt-source-pg-1',
+                    generationId: 'gen-source-pg',
+                    offset: 7,
+                    source: 'sn://pg-source-a.service-now.com',
+                }),
+            ], 0),
+            fixture.indexer,
+            10,
+            {
+                pollIntervalMs: 1,
+            },
+        );
+
+        const run = await worker.runOnce();
+
+        assert.equal(run.inserted, 1);
+
+        const withOriginalSource =
+            await fixture.indexer.getPartitionWatermarkStatus({
+                instanceId: 'sn-dev-01',
+                partition: 0,
+                source: 'sn://pg-source-a.service-now.com',
+                tenantId: 'tenant-acme',
+                topic: 'rez.cdc',
+            }, {
+                now: '2026-02-18T10:05:00.000Z',
+            });
+
+        assert.notEqual(withOriginalSource.watermark, null);
+        assert.equal(
+            withOriginalSource.watermark?.indexed_through_offset,
+            '7',
+        );
+
+        const withDifferentSource =
+            await fixture.indexer.getPartitionWatermarkStatus({
+                instanceId: 'sn-dev-01',
+                partition: 0,
+                source: 'sn://pg-source-b.service-now.com',
+                tenantId: 'tenant-acme',
+                topic: 'rez.cdc',
+            }, {
+                now: '2026-02-18T10:05:00.000Z',
+            });
+
+        assert.notEqual(withDifferentSource.watermark, null);
+        assert.equal(
+            withDifferentSource.watermark?.indexed_through_offset,
+            '7',
+        );
+    } finally {
+        await fixture.close();
+    }
+});

@@ -314,3 +314,84 @@ async () => {
     assert.equal(typeof logPayload.error_name, 'string');
     assert.equal(typeof logPayload.error_message, 'string');
 });
+
+test('watermark lookup matches partition scope regardless of source field',
+async () => {
+    const { indexer } = createIndexer();
+
+    await indexer.indexArtifact(buildTestInput({
+        eventId: 'evt-source-a',
+        generationId: 'gen-source',
+        offset: 5,
+        source: 'sn://source-a.service-now.com',
+    }));
+
+    const withOriginalSource = await indexer.getPartitionWatermarkStatus({
+        instanceId: 'sn-dev-01',
+        partition: 0,
+        source: 'sn://source-a.service-now.com',
+        tenantId: 'tenant-acme',
+        topic: 'rez.cdc',
+    }, {
+        now: '2026-02-16T12:06:00.000Z',
+    });
+
+    assert.notEqual(withOriginalSource.watermark, null);
+    assert.equal(
+        withOriginalSource.watermark?.indexed_through_offset,
+        '5',
+    );
+
+    const withDifferentSource = await indexer.getPartitionWatermarkStatus({
+        instanceId: 'sn-dev-01',
+        partition: 0,
+        source: 'sn://source-b.service-now.com',
+        tenantId: 'tenant-acme',
+        topic: 'rez.cdc',
+    }, {
+        now: '2026-02-16T12:06:00.000Z',
+    });
+
+    assert.notEqual(withDifferentSource.watermark, null);
+    assert.equal(
+        withDifferentSource.watermark?.indexed_through_offset,
+        '5',
+    );
+});
+
+test('duplicate event at lower offset does not throw invariant error',
+async () => {
+    const { indexer } = createIndexer();
+
+    await indexer.indexArtifact(buildTestInput({
+        eventId: 'evt-dedup-1',
+        generationId: 'gen-dedup',
+        offset: 5,
+    }));
+    await indexer.indexArtifact(buildTestInput({
+        eventId: 'evt-dedup-2',
+        generationId: 'gen-dedup',
+        offset: 10,
+    }));
+
+    const replay = await indexer.indexArtifact(buildTestInput({
+        eventId: 'evt-dedup-1',
+        generationId: 'gen-dedup',
+        offset: 5,
+    }));
+
+    assert.equal(replay.eventWriteState, 'existing');
+
+    const status = await indexer.getPartitionWatermarkStatus({
+        instanceId: 'sn-dev-01',
+        partition: 0,
+        source: 'sn://acme-dev.service-now.com',
+        tenantId: 'tenant-acme',
+        topic: 'rez.cdc',
+    }, {
+        now: '2026-02-16T12:08:00.000Z',
+    });
+
+    assert.equal(status.watermark?.indexed_through_offset, '10');
+    assert.equal(status.watermark?.generation_id, 'gen-dedup');
+});

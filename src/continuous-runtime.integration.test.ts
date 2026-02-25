@@ -195,3 +195,61 @@ async () => {
     );
     assert.equal(progress?.updated_at, '2026-02-18T11:05:00.000Z');
 });
+
+test('continuous loop does not double-count processed items on retry',
+async () => {
+    const scope = {
+        instanceId: 'sn-dev-01',
+        source: 'sn://acme-dev.service-now.com',
+        tenantId: 'tenant-acme',
+    };
+    const fixture = createFixture();
+    const validItem = buildTestInput({
+        eventId: 'evt-loop-retry-ok',
+        offset: 1,
+    });
+    const invalidItem = buildTestInput({
+        eventId: 'evt-loop-retry-bad',
+        metadata: {
+            short_description: 'plaintext not allowed',
+        },
+        offset: 2,
+    });
+    const source = new InMemoryArtifactBatchSource(
+        [validItem, invalidItem],
+        0,
+    );
+    const worker = new RestoreIndexerWorker(
+        source,
+        fixture.indexer,
+        10,
+        {
+            pollIntervalMs: 1,
+            sleep: async () => Promise.resolve(),
+            sourceProgressScope: scope,
+            timeProvider: () => '2026-02-18T11:10:00.000Z',
+        },
+    );
+
+    await worker.runOnce();
+
+    const progressAfterFirstAttempt =
+        await fixture.indexer.getSourceProgress(
+            scope.tenantId,
+            scope.instanceId,
+            scope.source,
+        );
+
+    assert.equal(progressAfterFirstAttempt?.processed_count, 1);
+
+    await worker.runOnce();
+
+    const progressAfterSecondAttempt =
+        await fixture.indexer.getSourceProgress(
+            scope.tenantId,
+            scope.instanceId,
+            scope.source,
+        );
+
+    assert.equal(progressAfterSecondAttempt?.processed_count, 2);
+});

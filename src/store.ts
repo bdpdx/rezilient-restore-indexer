@@ -784,7 +784,7 @@ export class PostgresRestoreIndexStore implements RestoreIndexStore {
                 indexed_at
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                $11, $12, $13, $14, $15::timestamptz, $16, $17, $18::bigint,
+                $11, $12, $13, $14, $15::timestamptz, $16, $17, $18,
                 $19, $20, $21, $22, $23, $24, $25, $26::timestamptz
             )
             ON CONFLICT (
@@ -855,14 +855,12 @@ export class PostgresRestoreIndexStore implements RestoreIndexStore {
             FROM ${this.partitionWatermarksTableQualified}
             WHERE tenant_id = $1
               AND instance_id = $2
-              AND source = $3
-              AND topic = $4
-              AND kafka_partition = $5
+              AND topic = $3
+              AND kafka_partition = $4
             LIMIT 1`,
             [
                 scope.tenantId,
                 scope.instanceId,
-                scope.source,
                 scope.topic,
                 scope.partition,
             ],

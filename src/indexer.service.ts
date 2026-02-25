@@ -154,21 +154,23 @@ function maxNullableOffset(
 ): string | null {
     const leftCanonical = left === null
         ? null
-        : canonicalizeOffset(left, 'source progress lastIndexedOffset');
+        : canonicalizeOffset(
+            left,
+            'source progress lastIndexedOffset',
+        );
     const rightCanonical = right === null
         ? null
-        : canonicalizeOffset(right, 'source progress lastIndexedOffset');
+        : canonicalizeOffset(
+            right,
+            'source progress lastIndexedOffset',
+        );
 
-    if (left === null) {
+    if (leftCanonical === null) {
         return rightCanonical;
     }
 
     if (rightCanonical === null) {
         return leftCanonical;
-    }
-
-    if (leftCanonical === null) {
-        return rightCanonical;
     }
 
     return compareOffsets(leftCanonical, rightCanonical) >= 0
@@ -422,12 +424,46 @@ export class RestoreIndexerService {
             throw new Error('Normalized metadata is missing offset');
         }
 
+        const eventRecord = buildEventRecord(
+            input,
+            normalized,
+            measuredAt,
+        );
+        const eventWriteState = await this.store.upsertIndexedEvent(
+            eventRecord,
+        );
         const currentRaw = await this.store.getPartitionWatermark(
             normalized.partitionScope,
         );
         const current = currentRaw === null
             ? null
             : canonicalizeWatermarkTimestamps(currentRaw);
+
+        if (eventWriteState === 'existing') {
+            if (current === null) {
+                const freshWatermark = buildNextWatermark(
+                    null,
+                    normalized.offset,
+                    normalized.eventTime,
+                    normalized.partitionScope,
+                    input.generationId,
+                    measuredAt,
+                );
+
+                await this.store.putPartitionWatermark(freshWatermark);
+
+                return {
+                    eventWriteState,
+                    watermark: freshWatermark,
+                };
+            }
+
+            return {
+                eventWriteState,
+                watermark: current,
+            };
+        }
+
         const nextWatermark = buildNextWatermark(
             current,
             normalized.offset,
@@ -436,37 +472,18 @@ export class RestoreIndexerService {
             input.generationId,
             measuredAt,
         );
-        const eventRecord = buildEventRecord(input, normalized, measuredAt);
-        const eventWriteState = await this.store.upsertIndexedEvent(
-            eventRecord,
-        );
 
-        if (eventWriteState === 'inserted') {
-            await this.store.putPartitionWatermark(nextWatermark);
-            await this.store.recomputeSourceCoverage({
-                instanceId: normalized.partitionScope.instanceId,
-                measuredAt,
-                source: normalized.partitionScope.source,
-                tenantId: normalized.partitionScope.tenantId,
-            });
-
-            return {
-                eventWriteState,
-                watermark: nextWatermark,
-            };
-        }
-
-        if (current === null) {
-            await this.store.putPartitionWatermark(nextWatermark);
-            return {
-                eventWriteState,
-                watermark: nextWatermark,
-            };
-        }
+        await this.store.putPartitionWatermark(nextWatermark);
+        await this.store.recomputeSourceCoverage({
+            instanceId: normalized.partitionScope.instanceId,
+            measuredAt,
+            source: normalized.partitionScope.source,
+            tenantId: normalized.partitionScope.tenantId,
+        });
 
         return {
             eventWriteState,
-            watermark: current,
+            watermark: nextWatermark,
         };
     }
 

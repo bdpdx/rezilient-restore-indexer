@@ -61,7 +61,7 @@ test('replay is idempotent and rewind requires a new generation', async () => {
 
     assert.equal(status.watermark?.generation_id, 'gen-2');
     assert.equal(status.watermark?.indexed_through_offset, '1');
-    assert.equal(store.getIndexedEventCount(), 3);
+    assert.equal(store.getIndexedEventCount(), 4);
 
     const coverage = await indexer.getSourceCoverageWindow(
         'tenant-acme',

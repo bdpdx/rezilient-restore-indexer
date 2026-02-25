@@ -423,7 +423,7 @@ export class RestoreIndexerWorker {
                 ? batch.realtimeLagSeconds
                 : null,
             measuredAt: this.timeProvider(),
-            processedDelta: result.inserted + result.existing + result.failures,
+            processedDelta: result.inserted + result.existing,
             source: this.sourceProgressScope.source,
             tenantId: this.sourceProgressScope.tenantId,
         });
