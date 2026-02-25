@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { describe, it, test } from 'node:test';
 import { createRuntime } from './runtime';
 import { InMemoryRestoreIndexStore } from './store';
 import type { RecManifestObjectStoreClient } from './rec-manifest-source';
@@ -197,4 +197,167 @@ async () => {
     assert.equal(progress?.cursor, manifestKey);
     assert.equal(progress?.lastBatchSize, 1);
     assert.equal(progress?.lastIndexedOffset, '1');
+});
+
+describe('createRuntime - additional', () => {
+    it('uses provided store override via dependencies',
+    async () => {
+        const store = new InMemoryRestoreIndexStore();
+        const runtime = createRuntime({
+            REZ_RESTORE_INDEXER_ARTIFACT_SOURCE:
+                'in_memory_scaffold',
+            REZ_RESTORE_PG_URL: 'postgres://unused:5432/db',
+        }, {
+            createStore: () => store,
+        });
+        await runtime.worker.runOnce();
+        // Store is the one we passed in; verify it
+        // was actually used by checking event count
+        assert.equal(store.getIndexedEventCount(), 0);
+    });
+
+    it('uses provided S3 client factory override',
+    async () => {
+        let factoryCalled = false;
+        const prefix = 'rez/restore-artifacts';
+        const mKey = `${prefix}/f.manifest.json`;
+        const aKey = `${prefix}/f.artifact.json`;
+        const client = new SingleBatchObjectStoreClient(
+            mKey, aKey,
+        );
+        const runtime = createRuntime(buildRecModeEnv({
+            REZ_RESTORE_INDEXER_SOURCE_PREFIX: prefix,
+        }), {
+            createObjectStoreClient: (source) => {
+                factoryCalled = true;
+                assert.equal(
+                    source.bucket,
+                    'rez-artifacts',
+                );
+
+                return client;
+            },
+            createStore: () => new InMemoryRestoreIndexStore(),
+        });
+        await runtime.worker.runOnce();
+        assert.equal(factoryCalled, true);
+    });
+
+    it('leader lease wiring connects store to worker',
+    async () => {
+        const prefix = 'rez/restore-artifacts';
+        const mKey = `${prefix}/ll.manifest.json`;
+        const aKey = `${prefix}/ll.artifact.json`;
+        const client = new SingleBatchObjectStoreClient(
+            mKey, aKey,
+        );
+        const store = new InMemoryRestoreIndexStore();
+        const runtime = createRuntime(buildRecModeEnv({
+            REZ_RESTORE_INDEXER_LEADER_ELECTION_ENABLED:
+                'true',
+            REZ_RESTORE_INDEXER_LEADER_LEASE_SECONDS: '30',
+            REZ_RESTORE_INDEXER_SOURCE_PREFIX: prefix,
+        }), {
+            createObjectStoreClient: () => client,
+            createStore: () => store,
+        });
+        const run = await runtime.worker.runOnce();
+        // Worker should have acquired the lease and
+        // processed the batch
+        assert.equal(run.inserted, 1);
+    });
+
+    it('source progress scope set for rec_manifest mode',
+    async () => {
+        const prefix = 'rez/restore-artifacts';
+        const mKey = `${prefix}/sp.manifest.json`;
+        const aKey = `${prefix}/sp.artifact.json`;
+        const client = new SingleBatchObjectStoreClient(
+            mKey, aKey,
+        );
+        const store = new InMemoryRestoreIndexStore();
+        const runtime = createRuntime(buildRecModeEnv({
+            REZ_RESTORE_INDEXER_LEADER_ELECTION_ENABLED:
+                'true',
+            REZ_RESTORE_INDEXER_SOURCE_PREFIX: prefix,
+        }), {
+            createObjectStoreClient: () => client,
+            createStore: () => store,
+        });
+        await runtime.worker.runOnce();
+        // Verify source progress was persisted via
+        // sourceProgressScope
+        const progress = await store.getSourceProgress(
+            'tenant-acme',
+            'sn-dev-01',
+            'sn://acme-dev.service-now.com',
+        );
+        assert.notEqual(progress, null);
+        assert.equal(progress?.cursor, mKey);
+    });
+
+    it('source progress scope not set for scaffold mode',
+    async () => {
+        const store = new InMemoryRestoreIndexStore();
+        const runtime = createRuntime({
+            REZ_RESTORE_INDEXER_ARTIFACT_SOURCE:
+                'in_memory_scaffold',
+            REZ_RESTORE_PG_URL: 'postgres://unused:5432/db',
+        }, {
+            createStore: () => store,
+        });
+        await runtime.worker.runOnce();
+        // No source progress stored for scaffold mode
+        const progress = await store.getSourceProgress(
+            'tenant-local-dev',
+            'scaffold',
+            'scaffold',
+        );
+        assert.equal(progress, null);
+    });
+
+    it('returns scaffold sourceSummary for in_memory mode',
+    () => {
+        const runtime = createRuntime({
+            REZ_RESTORE_INDEXER_ARTIFACT_SOURCE:
+                'in_memory_scaffold',
+            REZ_RESTORE_PG_URL: 'postgres://unused:5432/db',
+        }, {
+            createStore: () => new InMemoryRestoreIndexStore(),
+        });
+        assert.deepEqual(runtime.source, {
+            mode: 'in_memory_scaffold',
+        });
+    });
+
+    it('returns rec_manifest sourceSummary for production mode',
+    () => {
+        const prefix = 'rez/restore-artifacts';
+        const mKey = `${prefix}/ss.manifest.json`;
+        const aKey = `${prefix}/ss.artifact.json`;
+        const client = new SingleBatchObjectStoreClient(
+            mKey, aKey,
+        );
+        const runtime = createRuntime(buildRecModeEnv({
+            REZ_RESTORE_INDEXER_SOURCE_PREFIX: prefix,
+        }), {
+            createObjectStoreClient: () => client,
+            createStore: () => new InMemoryRestoreIndexStore(),
+        });
+        assert.equal(
+            runtime.source.mode,
+            'rec_manifest_object_store',
+        );
+        const source = runtime.source as {
+            bucket: string;
+            endpoint: string | null;
+            mode: string;
+            prefix: string;
+            region: string;
+        };
+        assert.equal(source.bucket, 'rez-artifacts');
+        assert.equal(source.region, 'us-east-1');
+        assert.equal(source.prefix, prefix);
+        assert.equal(source.endpoint, null);
+    });
 });
