@@ -366,7 +366,14 @@ function buildArtifactFailureContext(
     input: IndexArtifactInput,
 ): {
     artifact_key: string;
+    configured_tenant_id?: string;
     event_id: string;
+    manifest_instance_id?: string;
+    manifest_source?: string;
+    manifest_tenant_id?: string;
+    metadata_instance_id?: string;
+    metadata_source?: string;
+    metadata_tenant_id?: string;
     partition?: number;
     source?: string;
     tenant_id?: string;
@@ -374,17 +381,26 @@ function buildArtifactFailureContext(
 } {
     const metadata = input.metadata;
     const metadataEventId = readOptionalString(metadata.event_id);
+    const metadataInstanceId = readOptionalString(metadata.instance_id);
     const metadataTenantId = readOptionalString(metadata.tenant_id);
     const metadataSource = readOptionalString(metadata.source);
     const metadataTopic = readOptionalString(metadata.topic);
     const metadataPartition = readOptionalPartition(metadata.partition);
+    const manifestTenantId = readOptionalString(input.manifest.tenant_id);
 
     return {
         artifact_key: input.manifest.artifact_key,
+        configured_tenant_id: readOptionalString(input.tenantId),
         event_id: metadataEventId || input.manifest.event_id,
+        manifest_instance_id: input.manifest.instance_id,
+        manifest_source: input.manifest.source,
+        manifest_tenant_id: manifestTenantId,
+        metadata_instance_id: metadataInstanceId,
+        metadata_source: metadataSource,
+        metadata_tenant_id: metadataTenantId,
         partition: metadataPartition ?? input.manifest.partition,
         source: metadataSource || input.manifest.source,
-        tenant_id: metadataTenantId || input.tenantId,
+        tenant_id: metadataTenantId || manifestTenantId,
         topic: metadataTopic || input.manifest.topic,
     };
 }

@@ -35,6 +35,7 @@ export type ArtifactManifestInput = {
     event_id: string;
     event_time: string;
     event_type: string;
+    tenant_id?: string;
     instance_id: string;
     manifest_version: string;
     metadata_allowlist_version: string;

@@ -19,6 +19,7 @@ function buildValidManifest(overrides?: Record<string, unknown>) {
         event_id: 'evt-1',
         event_time: '2026-02-16T12:00:00.000Z',
         event_type: 'cdc.insert',
+        tenant_id: 'tenant-acme',
         instance_id: 'sn-dev-01',
         manifest_version: MANIFEST_VERSION,
         metadata_allowlist_version: ALLOWLIST_VERSION,
@@ -526,6 +527,37 @@ describe('extractMetadataFromArtifact (tested via readBatch)',
         assert.equal(
             batch.items[0].metadata.event_id,
             manifest.event_id,
+        );
+    });
+
+    it('does not fallback to configured tenant when canonical tenant is absent',
+    async () => {
+        const manifest = buildValidManifest({
+            tenant_id: undefined,
+        });
+        const artifact = buildValidArtifact({
+            tenant_id: undefined,
+        });
+        const manifestKey =
+            'rez/restore/no-tenant.manifest.json';
+        const client = createMockClient(
+            { [manifestKey]: manifest },
+            { [manifest.artifact_key]: artifact },
+        );
+        const source = createSource(client, {
+            tenantId: 'tenant-from-source-config',
+        });
+        const batch = await source.readBatch({
+            cursor: null,
+            limit: 10,
+        });
+        assert.equal(
+            batch.items[0].metadata.tenant_id,
+            undefined,
+        );
+        assert.equal(
+            batch.items[0].tenantId,
+            'tenant-from-source-config',
         );
     });
 

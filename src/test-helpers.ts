@@ -34,6 +34,7 @@ export function buildTestManifest(
     const offset = canonicalizeRestoreOffsetDecimalString(
         overrides.offset ?? 1,
     );
+    const tenantId = overrides.tenantId || 'tenant-acme';
     const source = overrides.source || 'sn://acme-dev.service-now.com';
     const instanceId = overrides.instanceId || 'sn-dev-01';
     const table = overrides.table || 'x_app.ticket';
@@ -46,6 +47,7 @@ export function buildTestManifest(
         event_id: eventId,
         event_time: eventTime,
         event_type: 'cdc.write',
+        tenant_id: tenantId,
         instance_id: instanceId,
         manifest_version: 'rec.artifact-manifest.v1',
         metadata_allowlist_version: RESTORE_METADATA_ALLOWLIST_VERSION,

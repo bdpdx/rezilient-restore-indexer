@@ -223,6 +223,7 @@ function parseManifest(
     const topic = readOptionalString(value.topic, 'manifest.topic');
     const partition = readOptionalInteger(value.partition, 'manifest.partition');
     const rawOffset = readOptionalString(value.offset, 'manifest.offset');
+    const tenantId = readOptionalString(value.tenant_id, 'manifest.tenant_id');
 
     if (
         topic === undefined
@@ -253,6 +254,7 @@ function parseManifest(
             'manifest.event_time',
         ),
         event_type: readRequiredString(value.event_type, 'manifest.event_type'),
+        tenant_id: tenantId,
         instance_id: readRequiredString(
             value.instance_id,
             'manifest.instance_id',
@@ -710,8 +712,11 @@ export class RecManifestArtifactBatchSource implements ArtifactBatchSource {
         );
         const metadata = extractMetadataFromArtifact(artifactPayload);
 
-        if (metadata.tenant_id === undefined) {
-            metadata.tenant_id = this.tenantId;
+        if (
+            metadata.tenant_id === undefined
+            && manifest.tenant_id !== undefined
+        ) {
+            metadata.tenant_id = manifest.tenant_id;
         }
 
         if (metadata.instance_id === undefined) {

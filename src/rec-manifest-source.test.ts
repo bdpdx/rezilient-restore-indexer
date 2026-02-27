@@ -134,6 +134,7 @@ function buildManifest(params: {
     partition?: number;
     source?: string;
     table?: string | null;
+    tenantId?: string;
     topic?: string;
 }): Record<string, unknown> {
     return {
@@ -156,6 +157,7 @@ function buildManifest(params: {
         partition: params.partition ?? 0,
         source: params.source || 'sn://acme-dev.service-now.com',
         table: params.table === undefined ? 'x_app.ticket' : params.table,
+        tenant_id: params.tenantId,
         topic: params.topic || 'rez.cdc',
     };
 }
@@ -539,6 +541,7 @@ async () => {
                     kind: 'schema',
                     offset: '000201',
                     table: 'x_app.ticket',
+                    tenantId: 'tenant-blue',
                     topic: 'rez.schema',
                 })),
             }],

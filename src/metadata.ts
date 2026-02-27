@@ -112,6 +112,41 @@ function canonicalizeTimestampField(
     }
 }
 
+function readOptionalCanonicalString(
+    value: unknown,
+): string | undefined {
+    if (typeof value !== 'string') {
+        return undefined;
+    }
+
+    const trimmed = value.trim();
+
+    if (!trimmed) {
+        return undefined;
+    }
+
+    return trimmed;
+}
+
+function enforceCanonicalIdentityMatch(
+    field: 'instance_id' | 'source' | 'tenant_id',
+    metadataValue: unknown,
+    manifestValue: string | undefined,
+): void {
+    const metadataCanonical = readOptionalCanonicalString(metadataValue);
+
+    if (metadataCanonical === undefined || manifestValue === undefined) {
+        return;
+    }
+
+    if (metadataCanonical !== manifestValue) {
+        throw new Error(
+            `Canonical identity mismatch for ${field}: `
+            + `metadata=${metadataCanonical} manifest=${manifestValue}`,
+        );
+    }
+}
+
 export function normalizeOperationalMetadata(
     input: IndexArtifactInput,
 ): NormalizedMetadata {
@@ -119,8 +154,27 @@ export function normalizeOperationalMetadata(
         ...input.metadata,
     };
 
-    if (merged.tenant_id === undefined) {
-        merged.tenant_id = input.tenantId;
+    enforceCanonicalIdentityMatch(
+        'tenant_id',
+        merged.tenant_id,
+        input.manifest.tenant_id,
+    );
+    enforceCanonicalIdentityMatch(
+        'instance_id',
+        merged.instance_id,
+        input.manifest.instance_id,
+    );
+    enforceCanonicalIdentityMatch(
+        'source',
+        merged.source,
+        input.manifest.source,
+    );
+
+    if (
+        merged.tenant_id === undefined
+        && input.manifest.tenant_id !== undefined
+    ) {
+        merged.tenant_id = input.manifest.tenant_id;
     }
 
     if (merged.instance_id === undefined) {
@@ -191,15 +245,21 @@ export function normalizeOperationalMetadata(
     const { offset, partition, topic } = ensureTopicPartitionOffset(metadata);
 
     if (!metadata.instance_id) {
-        throw new Error('Operational metadata is missing instance_id');
+        throw new Error(
+            'Canonical identity missing required field: instance_id',
+        );
     }
 
     if (!metadata.source) {
-        throw new Error('Operational metadata is missing source');
+        throw new Error(
+            'Canonical identity missing required field: source',
+        );
     }
 
     if (!metadata.tenant_id) {
-        throw new Error('Operational metadata is missing tenant_id');
+        throw new Error(
+            'Canonical identity missing required field: tenant_id',
+        );
     }
 
     if (!metadata.__time) {

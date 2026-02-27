@@ -15,20 +15,23 @@ describe('normalizeOperationalMetadata', () => {
         assert.ok(result.partitionScope);
     });
 
-    it('runtime metadata takes precedence over manifest', () => {
+    it('accepts matching canonical identity from metadata and manifest', () => {
         const input = buildTestInput({
-            instanceId: 'manifest-inst',
-            source: 'sn://manifest.service-now.com',
+            tenantId: 'tenant-canonical',
+            instanceId: 'instance-canonical',
+            source: 'sn://canonical.service-now.com',
             metadata: {
-                instance_id: 'runtime-inst',
-                source: 'sn://runtime.service-now.com',
+                tenant_id: 'tenant-canonical',
+                instance_id: 'instance-canonical',
+                source: 'sn://canonical.service-now.com',
             },
         });
         const result = normalizeOperationalMetadata(input);
-        assert.equal(result.metadata.instance_id, 'runtime-inst');
+        assert.equal(result.metadata.tenant_id, 'tenant-canonical');
+        assert.equal(result.metadata.instance_id, 'instance-canonical');
         assert.equal(
             result.metadata.source,
-            'sn://runtime.service-now.com',
+            'sn://canonical.service-now.com',
         );
     });
 
@@ -45,13 +48,74 @@ describe('normalizeOperationalMetadata', () => {
         );
     });
 
-    it('falls back to input.tenantId when tenant_id missing', () => {
+    it('falls back to manifest.tenant_id when metadata.tenant_id missing',
+    () => {
         const input = buildTestInput({
-            tenantId: 'tenant-fallback',
+            tenantId: 'tenant-env-fallback-disabled',
             metadata: { tenant_id: undefined },
         });
+        input.manifest.tenant_id = 'tenant-manifest-fallback';
         const result = normalizeOperationalMetadata(input);
-        assert.equal(result.metadata.tenant_id, 'tenant-fallback');
+        assert.equal(
+            result.metadata.tenant_id,
+            'tenant-manifest-fallback',
+        );
+    });
+
+    it('fails closed when tenant_id is missing from metadata and manifest',
+    () => {
+        const input = buildTestInput({
+            tenantId: 'tenant-env-fallback-disabled',
+            metadata: { tenant_id: undefined },
+        });
+        input.manifest.tenant_id = undefined;
+        assert.throws(
+            () => normalizeOperationalMetadata(input),
+            /Canonical identity missing required field: tenant_id/,
+        );
+    });
+
+    it('fails closed when canonical tenant_id mismatches manifest',
+    () => {
+        const input = buildTestInput({
+            tenantId: 'tenant-manifest',
+            metadata: {
+                tenant_id: 'tenant-mismatch',
+            },
+        });
+        input.manifest.tenant_id = 'tenant-manifest';
+        assert.throws(
+            () => normalizeOperationalMetadata(input),
+            /Canonical identity mismatch for tenant_id/,
+        );
+    });
+
+    it('fails closed when canonical instance_id mismatches manifest',
+    () => {
+        const input = buildTestInput({
+            instanceId: 'instance-manifest',
+            metadata: {
+                instance_id: 'instance-mismatch',
+            },
+        });
+        assert.throws(
+            () => normalizeOperationalMetadata(input),
+            /Canonical identity mismatch for instance_id/,
+        );
+    });
+
+    it('fails closed when canonical source mismatches manifest',
+    () => {
+        const input = buildTestInput({
+            source: 'sn://manifest.service-now.com',
+            metadata: {
+                source: 'sn://metadata.service-now.com',
+            },
+        });
+        assert.throws(
+            () => normalizeOperationalMetadata(input),
+            /Canonical identity mismatch for source/,
+        );
     });
 
     it('falls back to manifest.source when metadata.source missing',
@@ -351,6 +415,7 @@ describe('normalizeOperationalMetadata', () => {
 
     it('throws when tenant_id is empty string', () => {
         const manifest = buildTestManifest();
+        manifest.tenant_id = undefined;
         const input: IndexArtifactInput = {
             generationId: 'gen-01',
             ingestionMode: 'realtime',

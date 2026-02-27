@@ -134,6 +134,85 @@ describe('indexer helper functions (tested via indexArtifact)', () => {
     });
 });
 
+describe('canonical tuple enforcement', () => {
+    it('indexes partition watermarks under canonical manifest tuple',
+    async () => {
+        const { indexer, store } = createIndexer();
+        const input = buildTestInput({
+            instanceId: 'instance-canonical',
+            source: 'sn://canonical.service-now.com',
+            tenantId: 'tenant-config',
+            topic: 'rez.cdc',
+            partition: 7,
+            metadata: {
+                instance_id: undefined,
+                source: undefined,
+                tenant_id: undefined,
+            },
+        });
+
+        input.manifest.tenant_id = 'tenant-canonical';
+
+        await indexer.indexArtifact(input);
+
+        const canonicalScope = {
+            instanceId: 'instance-canonical',
+            partition: 7,
+            source: 'sn://canonical.service-now.com',
+            tenantId: 'tenant-canonical',
+            topic: 'rez.cdc',
+        };
+        const configScope = {
+            ...canonicalScope,
+            tenantId: 'tenant-config',
+        };
+        const canonicalWatermark = await store.getPartitionWatermark(
+            canonicalScope,
+        );
+        const configWatermark = await store.getPartitionWatermark(
+            configScope,
+        );
+
+        assert.notEqual(canonicalWatermark, null);
+        assert.equal(canonicalWatermark?.tenantId, 'tenant-canonical');
+        assert.equal(configWatermark, null);
+    });
+
+    it('fails closed when canonical tenant identity is absent',
+    async () => {
+        const { indexer } = createIndexer();
+        const input = buildTestInput({
+            tenantId: 'tenant-config',
+            metadata: {
+                tenant_id: undefined,
+            },
+        });
+
+        input.manifest.tenant_id = undefined;
+
+        await assert.rejects(
+            indexer.indexArtifact(input),
+            /Canonical identity missing required field: tenant_id/,
+        );
+    });
+
+    it('fails closed when canonical identity mismatches manifest tuple',
+    async () => {
+        const { indexer } = createIndexer();
+        const input = buildTestInput({
+            instanceId: 'instance-manifest',
+            metadata: {
+                instance_id: 'instance-mismatch',
+            },
+        });
+
+        await assert.rejects(
+            indexer.indexArtifact(input),
+            /Canonical identity mismatch for instance_id/,
+        );
+    });
+});
+
 describe('buildNextWatermark (tested via indexArtifact)', () => {
     it('creates new watermark from null (first event)', async () => {
         const { indexer } = createIndexer();

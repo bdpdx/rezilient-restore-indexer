@@ -111,6 +111,48 @@ test('worker keeps cursor pinned when a batch includes failures', async () => {
     assert.equal(store.getIndexedEventCount(), 2);
 });
 
+test('worker fails closed when canonical tenant identity is missing',
+async () => {
+    const store = new InMemoryRestoreIndexStore();
+    const indexer = new RestoreIndexerService(store, {
+        freshnessPolicy: {
+            staleAfterSeconds: 120,
+            timeoutSeconds: 60,
+        },
+    });
+    const invalid = buildTestInput({
+        eventId: 'evt-worker-no-tenant',
+        offset: 1,
+        tenantId: 'tenant-from-config',
+        metadata: {
+            tenant_id: undefined,
+        },
+    });
+
+    invalid.manifest.tenant_id = undefined;
+
+    const worker = new RestoreIndexerWorker(
+        new InMemoryArtifactBatchSource([invalid]),
+        indexer,
+        10,
+    );
+    const originalError = console.error;
+
+    console.error = () => {};
+
+    try {
+        const result = await worker.runOnce();
+
+        assert.equal(result.batchSize, 1);
+        assert.equal(result.inserted, 0);
+        assert.equal(result.failures, 1);
+        assert.equal(result.cursor, null);
+        assert.equal(store.getIndexedEventCount(), 0);
+    } finally {
+        console.error = originalError;
+    }
+});
+
 test('worker processes batches only while holding source leader lease',
 async () => {
     const store = new InMemoryRestoreIndexStore();
