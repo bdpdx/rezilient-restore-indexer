@@ -1,5 +1,12 @@
 import { canonicalizeRestoreOffsetDecimalString } from '@rezilient/types';
+import type { SourceCursorMode } from './env';
 import type { RestoreIndexerService } from './indexer.service';
+import {
+    parseSourceCursorState,
+    serializeSourceCursorState,
+    type SourceCursorReplayDefaults,
+    type SourceCursorV3State,
+} from './source-cursor';
 import type {
     IndexArtifactInput,
     ProcessBatchResult,
@@ -76,11 +83,18 @@ export type RestoreIndexerWorkerOptions = {
     leaderLease?: SourceLeaderLeaseOptions;
     pollIntervalMs?: number;
     sleep?: (ms: number) => Promise<void>;
+    sourceCursorMode?: SourceCursorMode;
     sourceProgressScope?: SourceProgressScope;
     timeProvider?: () => string;
 };
 
 const DEFAULT_POLL_INTERVAL_MS = 1000;
+const V1_OBJECT_KEY_LAYOUT_VERSION = 'rec.object-key-layout.v1';
+const V2_OBJECT_KEY_LAYOUT_VERSION = 'rec.object-key-layout.v2';
+const WORKER_CURSOR_REPLAY_DEFAULTS: SourceCursorReplayDefaults = {
+    enabled: false,
+    lowerBound: null,
+};
 
 function nowIso(): string {
     return new Date().toISOString();
@@ -99,6 +113,17 @@ function maxIso(
     right: string,
 ): string {
     return left >= right ? left : right;
+}
+
+function maxNullableIso(
+    left: string | null,
+    right: string,
+): string {
+    if (left === null) {
+        return right;
+    }
+
+    return maxIso(left, right);
 }
 
 function normalizeOffset(value: unknown): string | null {
@@ -127,6 +152,12 @@ function compareOffsets(
     return leftValue > rightValue ? 1 : -1;
 }
 
+function incrementOffset(
+    offset: string,
+): string {
+    return (BigInt(offset) + 1n).toString();
+}
+
 function readOffset(item: IndexArtifactInput): string | null {
     const metadataOffset = item.metadata.offset;
     const metadataCanonical = normalizeOffset(metadataOffset);
@@ -136,6 +167,57 @@ function readOffset(item: IndexArtifactInput): string | null {
     }
 
     return normalizeOffset(item.manifest.offset);
+}
+
+function readTopic(
+    item: IndexArtifactInput,
+): string | null {
+    const metadataTopic = item.metadata.topic;
+
+    if (typeof metadataTopic === 'string' && metadataTopic.trim().length > 0) {
+        return metadataTopic.trim();
+    }
+
+    if (
+        typeof item.manifest.topic === 'string'
+        && item.manifest.topic.trim().length > 0
+    ) {
+        return item.manifest.topic.trim();
+    }
+
+    return null;
+}
+
+function parsePartition(
+    value: unknown,
+): number | null {
+    if (typeof value === 'number' && Number.isInteger(value) && value >= 0) {
+        return value;
+    }
+
+    if (typeof value !== 'string') {
+        return null;
+    }
+
+    const trimmed = value.trim();
+
+    if (!/^\d+$/.test(trimmed)) {
+        return null;
+    }
+
+    return Number.parseInt(trimmed, 10);
+}
+
+function readPartition(
+    item: IndexArtifactInput,
+): number | null {
+    const metadataPartition = parsePartition(item.metadata.partition);
+
+    if (metadataPartition !== null) {
+        return metadataPartition;
+    }
+
+    return parsePartition(item.manifest.partition);
 }
 
 function latestEventTime(
@@ -175,6 +257,143 @@ function latestOffset(
     }
 
     return latest;
+}
+
+type V2ShardProgressCandidate = {
+    eventTime: string;
+    lastKey: string;
+    offset: string;
+    shardKey: string;
+};
+
+type V2ShardProgressUpdate = {
+    advancedShardCount: number;
+    updated: boolean;
+};
+
+type LayoutMixCounts = {
+    otherCount: number;
+    v1Count: number;
+    v2Count: number;
+};
+
+function buildV2ShardProgressCandidate(
+    item: IndexArtifactInput,
+): V2ShardProgressCandidate | null {
+    if (item.manifest.object_key_layout_version !== V2_OBJECT_KEY_LAYOUT_VERSION) {
+        return null;
+    }
+
+    const topic = readTopic(item);
+    const partition = readPartition(item);
+    const offset = readOffset(item);
+
+    if (topic === null || partition === null || offset === null) {
+        return null;
+    }
+
+    return {
+        eventTime: item.manifest.event_time,
+        lastKey: item.manifest.artifact_key,
+        offset,
+        shardKey: `${topic}|${partition}`,
+    };
+}
+
+function updateCursorV2ShardProgress(
+    cursorState: SourceCursorV3State,
+    items: IndexArtifactInput[],
+    measuredAt: string,
+): V2ShardProgressUpdate {
+    let updated = false;
+    const advancedShards = new Set<string>();
+
+    for (const item of items) {
+        const candidate = buildV2ShardProgressCandidate(item);
+
+        if (candidate === null) {
+            continue;
+        }
+
+        const candidateNextOffset = incrementOffset(candidate.offset);
+        const existingShard = cursorState.v2.by_shard[candidate.shardKey];
+
+        if (!existingShard) {
+            cursorState.v2.by_shard[candidate.shardKey] = {
+                last_event_time: candidate.eventTime,
+                last_key: candidate.lastKey,
+                next_offset: candidateNextOffset,
+            };
+            advancedShards.add(candidate.shardKey);
+            updated = true;
+            continue;
+        }
+
+        let shardUpdated = false;
+
+        if (
+            compareOffsets(candidateNextOffset, existingShard.next_offset) > 0
+        ) {
+            existingShard.next_offset = candidateNextOffset;
+            existingShard.last_key = candidate.lastKey;
+            advancedShards.add(candidate.shardKey);
+            shardUpdated = true;
+        } else if (existingShard.last_key === null) {
+            existingShard.last_key = candidate.lastKey;
+            shardUpdated = true;
+        }
+
+        const mergedEventTime = maxNullableIso(
+            existingShard.last_event_time,
+            candidate.eventTime,
+        );
+
+        if (mergedEventTime !== existingShard.last_event_time) {
+            existingShard.last_event_time = mergedEventTime;
+            shardUpdated = true;
+        }
+
+        if (shardUpdated) {
+            updated = true;
+        }
+    }
+
+    if (updated) {
+        cursorState.v2.last_reconcile_at = measuredAt;
+    }
+
+    return {
+        advancedShardCount: advancedShards.size,
+        updated,
+    };
+}
+
+function summarizeLayoutMix(
+    items: IndexArtifactInput[],
+): LayoutMixCounts {
+    const counts: LayoutMixCounts = {
+        otherCount: 0,
+        v1Count: 0,
+        v2Count: 0,
+    };
+
+    for (const item of items) {
+        const version = item.manifest.object_key_layout_version;
+
+        if (version === V1_OBJECT_KEY_LAYOUT_VERSION) {
+            counts.v1Count += 1;
+            continue;
+        }
+
+        if (version === V2_OBJECT_KEY_LAYOUT_VERSION) {
+            counts.v2Count += 1;
+            continue;
+        }
+
+        counts.otherCount += 1;
+    }
+
+    return counts;
 }
 
 function defaultScanCounters(): ArtifactBatchScanCounters {
@@ -226,6 +445,17 @@ function summarizeCursor(
     return `${compact.slice(0, maxLength)}...`;
 }
 
+type CursorResolution = {
+    nextCursor: string | null;
+    v2ShardAdvancements: number;
+};
+
+type CursorHealthSummary = {
+    parseFailed: boolean;
+    v2LastReconcileAt: string | null;
+    v2ShardsTracked: number;
+};
+
 export class RestoreIndexerWorker {
     private cursor: string | null = null;
 
@@ -240,6 +470,8 @@ export class RestoreIndexerWorker {
     private readonly sleep: (ms: number) => Promise<void>;
 
     private readonly leaderLease?: SourceLeaderLeaseOptions;
+
+    private readonly sourceCursorMode: SourceCursorMode;
 
     private readonly sourceProgressScope?: SourceProgressScope;
 
@@ -257,6 +489,7 @@ export class RestoreIndexerWorker {
             ?? DEFAULT_POLL_INTERVAL_MS;
         this.sleep = options.sleep ?? sleepMs;
         this.leaderLease = options.leaderLease;
+        this.sourceCursorMode = options.sourceCursorMode ?? 'mixed';
         this.sourceProgressScope = options.sourceProgressScope;
         this.timeProvider = options.timeProvider ?? nowIso;
 
@@ -321,20 +554,25 @@ export class RestoreIndexerWorker {
 
         const result = await this.indexer.processBatch(batch.items);
         const advanceCursor = result.failures === 0;
-        const nextCursor = advanceCursor
-            ? batch.nextCursor
-            : this.cursor;
+        const measuredAt = this.timeProvider();
+        const cursorResolution = this.resolveNextCursor(batch, {
+            advanceCursor,
+            measuredAt,
+        });
+        const nextCursor = cursorResolution.nextCursor;
 
         this.cursor = nextCursor;
 
         await this.persistSourceProgress(batch, result, {
             advanceCursor,
+            measuredAt,
             nextCursor,
         });
         this.logBatchOutcome(batch, result, {
             advanceCursor,
             nextCursor,
             previousCursor,
+            v2ShardAdvancements: cursorResolution.v2ShardAdvancements,
         });
 
         return {
@@ -475,6 +713,7 @@ export class RestoreIndexerWorker {
         result: ProcessBatchResult,
         cursor: {
             advanceCursor: boolean;
+            measuredAt: string;
             nextCursor: string | null;
         },
     ): Promise<void> {
@@ -493,11 +732,61 @@ export class RestoreIndexerWorker {
             lastLagSeconds: cursor.advanceCursor
                 ? batch.realtimeLagSeconds
                 : null,
-            measuredAt: this.timeProvider(),
+            measuredAt: cursor.measuredAt,
             processedDelta: result.inserted + result.existing,
             source: this.sourceProgressScope.source,
             tenantId: this.sourceProgressScope.tenantId,
         });
+    }
+
+    private resolveNextCursor(
+        batch: ArtifactBatch,
+        input: {
+            advanceCursor: boolean;
+            measuredAt: string;
+        },
+    ): CursorResolution {
+        if (!input.advanceCursor) {
+            return {
+                nextCursor: this.cursor,
+                v2ShardAdvancements: 0,
+            };
+        }
+
+        const nextCursor = batch.nextCursor;
+        const hasV2Items = batch.items.some((item) => {
+            return item.manifest.object_key_layout_version
+                === V2_OBJECT_KEY_LAYOUT_VERSION;
+        });
+
+        if (!hasV2Items) {
+            return {
+                nextCursor,
+                v2ShardAdvancements: 0,
+            };
+        }
+
+        const cursorState = parseSourceCursorState(
+            nextCursor,
+            WORKER_CURSOR_REPLAY_DEFAULTS,
+        );
+        const cursorUpdate = updateCursorV2ShardProgress(
+            cursorState,
+            batch.items,
+            input.measuredAt,
+        );
+
+        if (!cursorUpdate.updated) {
+            return {
+                nextCursor,
+                v2ShardAdvancements: cursorUpdate.advancedShardCount,
+            };
+        }
+
+        return {
+            nextCursor: serializeSourceCursorState(cursorState),
+            v2ShardAdvancements: cursorUpdate.advancedShardCount,
+        };
     }
 
     private logBatchOutcome(
@@ -507,9 +796,12 @@ export class RestoreIndexerWorker {
             advanceCursor: boolean;
             nextCursor: string | null;
             previousCursor: string | null;
+            v2ShardAdvancements: number;
         },
     ): void {
         const scanCounters = batch.scanCounters || defaultScanCounters();
+        const layoutMix = summarizeLayoutMix(batch.items);
+        const cursorHealth = this.summarizeCursorHealth(cursor.nextCursor);
 
         console.log('restore-indexer batch processed', {
             advance_cursor: cursor.advanceCursor,
@@ -526,7 +818,57 @@ export class RestoreIndexerWorker {
             replay_only_hit_count: scanCounters.replayOnlyHitCount,
             replay_path_selected_key_count:
                 scanCounters.replayPathSelectedKeyCount,
+            source_cursor_mode: this.sourceCursorMode,
+            v2_last_reconcile_at: cursorHealth.v2LastReconcileAt,
+            v2_shard_advancements: cursor.v2ShardAdvancements,
+            v2_shard_health_parse_failed: cursorHealth.parseFailed,
+            v2_shards_tracked: cursorHealth.v2ShardsTracked,
+            v2_primary_mode_legacy_v1_items_present:
+                this.sourceCursorMode === 'v2_primary'
+                && layoutMix.v1Count > 0,
+            v2_ready_no_v1_seen:
+                layoutMix.v2Count > 0
+                && layoutMix.v1Count === 0,
+            version_mix_other_count: layoutMix.otherCount,
+            version_mix_v1_count: layoutMix.v1Count,
+            version_mix_v2_count: layoutMix.v2Count,
         });
+
+        if (
+            this.sourceCursorMode === 'v2_primary'
+            && layoutMix.v1Count > 0
+        ) {
+            console.warn(
+                'restore-indexer v2_primary observed legacy v1 manifests',
+                {
+                    legacy_v1_count: layoutMix.v1Count,
+                    v2_count: layoutMix.v2Count,
+                },
+            );
+        }
+    }
+
+    private summarizeCursorHealth(
+        cursor: string | null,
+    ): CursorHealthSummary {
+        try {
+            const state = parseSourceCursorState(
+                cursor,
+                WORKER_CURSOR_REPLAY_DEFAULTS,
+            );
+
+            return {
+                parseFailed: false,
+                v2LastReconcileAt: state.v2.last_reconcile_at,
+                v2ShardsTracked: Object.keys(state.v2.by_shard).length,
+            };
+        } catch {
+            return {
+                parseFailed: true,
+                v2LastReconcileAt: null,
+                v2ShardsTracked: 0,
+            };
+        }
     }
 
     private logSourceCursorFailure(

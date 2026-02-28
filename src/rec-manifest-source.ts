@@ -11,8 +11,9 @@ import {
     parseSourceCursorState,
     serializeSourceCursorState,
     type SourceCursorReplayDefaults,
-    type SourceCursorV2State,
+    type SourceCursorV3State,
 } from './source-cursor';
+import type { SourceCursorMode } from './env';
 import type {
     ArtifactManifestInput,
     IndexArtifactInput,
@@ -25,7 +26,10 @@ import type {
 } from './worker';
 
 const REC_ARTIFACT_MANIFEST_VERSION = 'rec.artifact-manifest.v1';
-const REC_OBJECT_KEY_LAYOUT_VERSION = 'rec.object-key-layout.v1';
+const REC_OBJECT_KEY_LAYOUT_VERSIONS = new Set([
+    'rec.object-key-layout.v1',
+    'rec.object-key-layout.v2',
+]);
 const DEFAULT_MAX_ATTEMPTS = 3;
 const DEFAULT_RETRY_BASE_MS = 200;
 const DEFAULT_LIST_PAGE_MIN_LIMIT = 100;
@@ -58,6 +62,7 @@ export interface RecManifestObjectStoreClient {
 }
 
 export type RecManifestArtifactBatchSourceOptions = {
+    cursorMode?: SourceCursorMode;
     cursorReplay?: Partial<{
         enabled: boolean;
         intervalSeconds: number;
@@ -262,7 +267,7 @@ function parseManifest(
         'manifest.object_key_layout_version',
     );
 
-    if (objectKeyLayoutVersion !== REC_OBJECT_KEY_LAYOUT_VERSION) {
+    if (!REC_OBJECT_KEY_LAYOUT_VERSIONS.has(objectKeyLayoutVersion)) {
         throw new Error(
             'unsupported manifest.object_key_layout_version: '
             + objectKeyLayoutVersion,
@@ -772,11 +777,13 @@ function wrapCursorParseError(
         + `cursor_preview=${summarizeCursorForLog(cursor)}; `
         + 'manual_remediation='
         + 'update rez_restore_index.source_progress.cursor to a valid '
-        + 'legacy string or v2 JSON payload',
+        + 'legacy string or v2/v3 JSON payload',
     );
 }
 
 export class RecManifestArtifactBatchSource implements ArtifactBatchSource {
+    private readonly cursorMode: SourceCursorMode;
+
     private readonly cursorReplay: RecManifestCursorReplayConfig;
 
     private readonly generationId: string;
@@ -826,6 +833,7 @@ export class RecManifestArtifactBatchSource implements ArtifactBatchSource {
             1,
             options.maxAttempts || DEFAULT_MAX_ATTEMPTS,
         );
+        this.cursorMode = options.cursorMode || 'mixed';
         this.cursorReplay = normalizeCursorReplayConfig(options.cursorReplay);
         this.cursorReplayDefaults = {
             enabled: this.cursorReplay.enabled,
@@ -843,7 +851,7 @@ export class RecManifestArtifactBatchSource implements ArtifactBatchSource {
         cursor: string | null;
         limit: number;
     }): Promise<ArtifactBatch> {
-        let cursorState: SourceCursorV2State;
+        let cursorState: SourceCursorV3State;
 
         try {
             cursorState = parseSourceCursorState(
@@ -881,15 +889,29 @@ export class RecManifestArtifactBatchSource implements ArtifactBatchSource {
         }
 
         const latestEventTime = latestManifestEventTime(items);
-        const nextCursorState: SourceCursorV2State = {
+        const nextReplayState = {
+            enabled: cursorState.legacy.replay.enabled,
+            last_replay_at: selected.replayRan
+                ? nowIsoValue
+                : cursorState.legacy.replay.last_replay_at,
+            lower_bound: selected.replayLowerBound,
+        };
+        const nextCursorState: SourceCursorV3State = {
+            legacy: {
+                replay: {
+                    enabled: nextReplayState.enabled,
+                    last_replay_at: nextReplayState.last_replay_at,
+                    lower_bound: nextReplayState.lower_bound,
+                },
+                scan_cursor: selected.nextScanCursor,
+            },
             replay: {
-                enabled: cursorState.replay.enabled,
-                last_replay_at: selected.replayRan
-                    ? nowIsoValue
-                    : cursorState.replay.last_replay_at,
-                lower_bound: selected.replayLowerBound,
+                enabled: cursorState.legacy.replay.enabled,
+                last_replay_at: nextReplayState.last_replay_at,
+                lower_bound: nextReplayState.lower_bound,
             },
             scan_cursor: selected.nextScanCursor,
+            v2: cursorState.v2,
             v: cursorState.v,
         };
 
@@ -910,7 +932,7 @@ export class RecManifestArtifactBatchSource implements ArtifactBatchSource {
     }
 
     private async collectManifestKeys(input: {
-        cursorState: SourceCursorV2State;
+        cursorState: SourceCursorV3State;
         limit: number;
         nowIsoValue: string;
     }): Promise<{
@@ -923,9 +945,9 @@ export class RecManifestArtifactBatchSource implements ArtifactBatchSource {
         selectedKeys: string[];
     }> {
         const fastKeys = await this.listManifestKeys({
-            lowerExclusive: input.cursorState.scan_cursor,
+            lowerExclusive: input.cursorState.legacy.scan_cursor,
             maxKeys: input.limit,
-            startAfter: input.cursorState.scan_cursor,
+            startAfter: input.cursorState.legacy.scan_cursor,
             upperExclusive: null,
         });
         const replayLowerBound = this.resolveReplayLowerBound(
@@ -1054,14 +1076,14 @@ export class RecManifestArtifactBatchSource implements ArtifactBatchSource {
     }
 
     private resolveReplayLowerBound(
-        cursorState: SourceCursorV2State,
+        cursorState: SourceCursorV3State,
         firstFastKey: string | null,
     ): string | null {
-        if (cursorState.replay.lower_bound !== null) {
-            return cursorState.replay.lower_bound;
+        if (cursorState.legacy.replay.lower_bound !== null) {
+            return cursorState.legacy.replay.lower_bound;
         }
 
-        if (cursorState.scan_cursor !== null) {
+        if (cursorState.legacy.scan_cursor !== null) {
             return this.prefix;
         }
 
@@ -1069,30 +1091,31 @@ export class RecManifestArtifactBatchSource implements ArtifactBatchSource {
     }
 
     private shouldRunReplayCycle(
-        cursorState: SourceCursorV2State,
+        cursorState: SourceCursorV3State,
         replayLowerBound: string | null,
         nowIsoValue: string,
     ): boolean {
         if (
-            !cursorState.replay.enabled
+            !cursorState.legacy.replay.enabled
             || !this.cursorReplay.enabled
+            || this.cursorMode !== 'mixed'
         ) {
             return false;
         }
 
         if (
-            cursorState.scan_cursor === null
+            cursorState.legacy.scan_cursor === null
             || replayLowerBound === null
         ) {
             return false;
         }
 
-        if (replayLowerBound >= cursorState.scan_cursor) {
+        if (replayLowerBound >= cursorState.legacy.scan_cursor) {
             return false;
         }
 
         return shouldRunReplay(
-            cursorState.replay.last_replay_at,
+            cursorState.legacy.replay.last_replay_at,
             nowIsoValue,
             this.cursorReplay.intervalSeconds,
         );

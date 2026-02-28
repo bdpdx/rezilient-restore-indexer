@@ -77,6 +77,44 @@ WHERE tenant_id = '<tenant_id>'
 5. Do not use broad cursor resets as first response if parse errors are not
    present; prefer diagnosing artifact/indexing failures first.
 
+## 0.2 DRK-06 Cutover Controls (`mixed` -> `v2_primary`)
+
+1. Runtime control:
+   - `REZ_RESTORE_INDEXER_SOURCE_CURSOR_MODE=mixed` (default): replay-enabled
+     migration behavior for dual-layout (`v1` + `v2`) windows.
+   - `REZ_RESTORE_INDEXER_SOURCE_CURSOR_MODE=v2_primary`: replay fallback is
+     disabled and v2 shard progression becomes the primary correctness path.
+2. Cutover readiness gates (hold `mixed` until all pass):
+   - REC rollout is `dual` or `v2` and remains stable across multiple cycles.
+   - `restore-indexer batch processed` logs show sustained
+     `version_mix_v2_count > 0`.
+   - `version_mix_v1_count` trends toward `0` for the target source scope.
+   - `v2_shard_advancements > 0` appears during active ingest windows and
+     `v2_last_reconcile_at` keeps moving.
+3. Cutover procedure:
+   - set `REZ_RESTORE_INDEXER_SOURCE_CURSOR_MODE=v2_primary`,
+   - restart the indexer worker process,
+   - verify startup log includes `source_cursor_mode=v2_primary`,
+   - monitor per-batch fields:
+     - `version_mix_v1_count`,
+     - `version_mix_v2_count`,
+     - `v2_shard_advancements`,
+     - `v2_shards_tracked`,
+     - `v2_primary_mode_legacy_v1_items_present`.
+4. Rollback procedure:
+   - if v2 progression stalls, if readiness fields regress, or if
+     `v2_primary_mode_legacy_v1_items_present=true` persists unexpectedly,
+     revert to `REZ_RESTORE_INDEXER_SOURCE_CURSOR_MODE=mixed`,
+   - restart worker and confirm replay counters recover expected late-key
+     behavior,
+   - keep REC in `dual` until stable forward progression is re-established.
+5. Replay retirement policy:
+   - keep replay controls configured even in v2-primary mode for emergency
+     rollback,
+   - only consider replay settings operationally retired after sustained
+     v2-only REC emission and zero rollback incidents across the agreed
+     stability window.
+
 ## 1. Sidecar Lag / Freshness Breach
 
 1. Query freshness status in restore admin:

@@ -14,6 +14,19 @@ import {
     RestoreIndexerWorker,
 } from './worker';
 
+function buildV2Input(
+    overrides: Parameters<typeof buildTestInput>[0] = {},
+) {
+    const input = buildTestInput(overrides);
+
+    input.manifest.object_key_layout_version = 'rec.object-key-layout.v2';
+    input.metadata.topic = input.manifest.topic;
+    input.metadata.partition = input.manifest.partition;
+    input.metadata.offset = input.manifest.offset;
+
+    return input;
+}
+
 test('worker polls source and writes indexed metadata batches', async () => {
     const store = new InMemoryRestoreIndexStore();
     const indexer = new RestoreIndexerService(store, {
@@ -570,6 +583,362 @@ async () => {
     );
 });
 
+test('worker restart resumes and advances v2 shard cursor progress',
+async () => {
+    const store = new InMemoryRestoreIndexStore();
+    const scope = {
+        instanceId: 'sn-dev-01',
+        source: 'sn://acme-dev.service-now.com',
+        tenantId: 'tenant-acme',
+    };
+    const indexer = new RestoreIndexerService(store, {
+        freshnessPolicy: {
+            staleAfterSeconds: 120,
+            timeoutSeconds: 60,
+        },
+    });
+    const seedItem = buildV2Input({
+        eventId: 'evt-worker-v2-seed',
+        eventTime: '2026-02-18T13:59:00.000Z',
+        offset: 10,
+        partition: 0,
+        topic: 'rez.cdc',
+    });
+    const resumedItem = buildV2Input({
+        eventId: 'evt-worker-v2-resume',
+        eventTime: '2026-02-18T14:00:00.000Z',
+        offset: 11,
+        partition: 0,
+        topic: 'rez.cdc',
+    });
+    const initialCursor = serializeSourceCursorState({
+        replay: {
+            enabled: true,
+            last_replay_at: '2026-02-18T13:58:00.000Z',
+            lower_bound: 'rez/restore-artifacts',
+        },
+        scan_cursor: 'rez/restore-artifacts/kind=schema/800.manifest.json',
+        v2: {
+            by_shard: {
+                'rez.cdc|0': {
+                    last_event_time: seedItem.manifest.event_time,
+                    last_key: seedItem.manifest.artifact_key,
+                    next_offset: '11',
+                },
+            },
+            last_reconcile_at: '2026-02-18T13:58:30.000Z',
+        },
+        v: SOURCE_CURSOR_VERSION,
+    });
+    const nextCursor = serializeSourceCursorState({
+        replay: {
+            enabled: true,
+            last_replay_at: '2026-02-18T14:00:30.000Z',
+            lower_bound: 'rez/restore-artifacts',
+        },
+        scan_cursor: 'rez/restore-artifacts/kind=schema/820.manifest.json',
+        v2: {
+            by_shard: {
+                'rez.cdc|0': {
+                    last_event_time: seedItem.manifest.event_time,
+                    last_key: seedItem.manifest.artifact_key,
+                    next_offset: '11',
+                },
+            },
+            last_reconcile_at: '2026-02-18T13:58:30.000Z',
+        },
+        v: SOURCE_CURSOR_VERSION,
+    });
+
+    await indexer.recordSourceProgress({
+        cursor: initialCursor,
+        instanceId: scope.instanceId,
+        lastBatchSize: 0,
+        lastIndexedEventTime: null,
+        lastIndexedOffset: null,
+        lastLagSeconds: null,
+        measuredAt: '2026-02-18T13:58:59.000Z',
+        processedDelta: 0,
+        source: scope.source,
+        tenantId: scope.tenantId,
+    });
+
+    let receivedCursor: string | null = null;
+    const source: ArtifactBatchSource = {
+        async readBatch(input) {
+            receivedCursor = input.cursor;
+
+            return {
+                items: [resumedItem],
+                nextCursor,
+                realtimeLagSeconds: 8,
+                scanCounters: {
+                    fastPathSelectedKeyCount: 1,
+                    replayCycleRan: false,
+                    replayOnlyHitCount: 0,
+                    replayPathSelectedKeyCount: 0,
+                },
+            };
+        },
+    };
+    const worker = new RestoreIndexerWorker(
+        source,
+        indexer,
+        10,
+        {
+            sourceProgressScope: scope,
+            timeProvider: () => '2026-02-18T14:01:00.000Z',
+        },
+    );
+    const run = await worker.runOnce();
+
+    assert.equal(run.inserted, 1);
+    assert.equal(receivedCursor, initialCursor);
+
+    const progress = await indexer.getSourceProgress(
+        scope.tenantId,
+        scope.instanceId,
+        scope.source,
+    );
+    const parsed = parseSourceCursorState(progress?.cursor || null, {
+        enabled: true,
+        lowerBound: 'rez/restore-artifacts',
+    });
+
+    assert.equal(
+        parsed.scan_cursor,
+        'rez/restore-artifacts/kind=schema/820.manifest.json',
+    );
+    assert.equal(parsed.v2.by_shard['rez.cdc|0']?.next_offset, '12');
+    assert.equal(
+        parsed.v2.by_shard['rez.cdc|0']?.last_key,
+        resumedItem.manifest.artifact_key,
+    );
+    assert.equal(
+        parsed.v2.by_shard['rez.cdc|0']?.last_event_time,
+        resumedItem.manifest.event_time,
+    );
+    assert.equal(parsed.v2.last_reconcile_at, '2026-02-18T14:01:00.000Z');
+});
+
+test('worker leader handoff preserves v2 shard cursor continuity',
+async () => {
+    const store = new InMemoryRestoreIndexStore();
+    const scope = {
+        instanceId: 'sn-dev-01',
+        source: 'sn://acme-dev.service-now.com',
+        tenantId: 'tenant-acme',
+    };
+    const indexer = new RestoreIndexerService(store, {
+        freshnessPolicy: {
+            staleAfterSeconds: 120,
+            timeoutSeconds: 60,
+        },
+    });
+    const seedItem = buildV2Input({
+        eventId: 'evt-worker-v2-handoff-seed',
+        eventTime: '2026-02-18T14:09:00.000Z',
+        offset: 29,
+        partition: 0,
+        topic: 'rez.cdc',
+    });
+    const workerAItem = buildV2Input({
+        eventId: 'evt-worker-v2-handoff-a',
+        eventTime: '2026-02-18T14:10:00.000Z',
+        offset: 30,
+        partition: 0,
+        topic: 'rez.cdc',
+    });
+    const workerBItem = buildV2Input({
+        eventId: 'evt-worker-v2-handoff-b',
+        eventTime: '2026-02-18T14:11:00.000Z',
+        offset: 31,
+        partition: 0,
+        topic: 'rez.cdc',
+    });
+    const initialCursor = serializeSourceCursorState({
+        replay: {
+            enabled: true,
+            last_replay_at: '2026-02-18T14:08:00.000Z',
+            lower_bound: 'rez/restore-artifacts',
+        },
+        scan_cursor: 'rez/restore-artifacts/kind=schema/900.manifest.json',
+        v2: {
+            by_shard: {
+                'rez.cdc|0': {
+                    last_event_time: seedItem.manifest.event_time,
+                    last_key: seedItem.manifest.artifact_key,
+                    next_offset: '30',
+                },
+            },
+            last_reconcile_at: '2026-02-18T14:08:30.000Z',
+        },
+        v: SOURCE_CURSOR_VERSION,
+    });
+    const cursorAfterWorkerA = serializeSourceCursorState({
+        replay: {
+            enabled: true,
+            last_replay_at: '2026-02-18T14:10:30.000Z',
+            lower_bound: 'rez/restore-artifacts',
+        },
+        scan_cursor: 'rez/restore-artifacts/kind=schema/920.manifest.json',
+        v2: {
+            by_shard: {
+                'rez.cdc|0': {
+                    last_event_time: seedItem.manifest.event_time,
+                    last_key: seedItem.manifest.artifact_key,
+                    next_offset: '30',
+                },
+            },
+            last_reconcile_at: '2026-02-18T14:08:30.000Z',
+        },
+        v: SOURCE_CURSOR_VERSION,
+    });
+
+    await indexer.recordSourceProgress({
+        cursor: initialCursor,
+        instanceId: scope.instanceId,
+        lastBatchSize: 0,
+        lastIndexedEventTime: null,
+        lastIndexedOffset: null,
+        lastLagSeconds: null,
+        measuredAt: '2026-02-18T14:08:59.000Z',
+        processedDelta: 0,
+        source: scope.source,
+        tenantId: scope.tenantId,
+    });
+
+    let workerBCursor: string | null = null;
+    let workerBReadCalls = 0;
+    const sourceA: ArtifactBatchSource = {
+        async readBatch() {
+            return {
+                items: [workerAItem],
+                nextCursor: cursorAfterWorkerA,
+                realtimeLagSeconds: 5,
+                scanCounters: {
+                    fastPathSelectedKeyCount: 1,
+                    replayCycleRan: false,
+                    replayOnlyHitCount: 0,
+                    replayPathSelectedKeyCount: 0,
+                },
+            };
+        },
+    };
+    const sourceB: ArtifactBatchSource = {
+        async readBatch(input) {
+            workerBReadCalls += 1;
+            workerBCursor = input.cursor;
+            const parsed = parseSourceCursorState(input.cursor, {
+                enabled: true,
+                lowerBound: 'rez/restore-artifacts',
+            });
+            const nextCursor = serializeSourceCursorState({
+                replay: {
+                    enabled: true,
+                    last_replay_at: '2026-02-18T14:11:30.000Z',
+                    lower_bound: 'rez/restore-artifacts',
+                },
+                scan_cursor:
+                    'rez/restore-artifacts/kind=schema/930.manifest.json',
+                v2: parsed.v2,
+                v: SOURCE_CURSOR_VERSION,
+            });
+
+            return {
+                items: [workerBItem],
+                nextCursor,
+                realtimeLagSeconds: 4,
+                scanCounters: {
+                    fastPathSelectedKeyCount: 1,
+                    replayCycleRan: false,
+                    replayOnlyHitCount: 0,
+                    replayPathSelectedKeyCount: 0,
+                },
+            };
+        },
+    };
+    const workerA = new RestoreIndexerWorker(
+        sourceA,
+        indexer,
+        10,
+        {
+            leaderLease: {
+                holderId: 'holder-a',
+                leaseDurationSeconds: 30,
+                manager: store,
+            },
+            sourceProgressScope: scope,
+            timeProvider: () => '2026-02-18T14:10:40.000Z',
+        },
+    );
+    const workerB = new RestoreIndexerWorker(
+        sourceB,
+        indexer,
+        10,
+        {
+            leaderLease: {
+                holderId: 'holder-b',
+                leaseDurationSeconds: 30,
+                manager: store,
+            },
+            sourceProgressScope: scope,
+            timeProvider: () => '2026-02-18T14:11:40.000Z',
+        },
+    );
+
+    const first = await workerA.runOnce();
+
+    assert.equal(first.inserted, 1);
+
+    const progressAfterWorkerA = await indexer.getSourceProgress(
+        scope.tenantId,
+        scope.instanceId,
+        scope.source,
+    );
+
+    assert.notEqual(progressAfterWorkerA?.cursor, null);
+
+    const blocked = await workerB.runOnce();
+
+    assert.equal(blocked.batchSize, 0);
+    assert.equal(workerBReadCalls, 0);
+
+    await store.releaseSourceLeaderLease({
+        holderId: 'holder-a',
+        instanceId: scope.instanceId,
+        source: scope.source,
+        tenantId: scope.tenantId,
+    });
+
+    const handedOff = await workerB.runOnce();
+
+    assert.equal(handedOff.inserted, 1);
+    assert.equal(workerBReadCalls, 1);
+    assert.equal(workerBCursor, progressAfterWorkerA?.cursor || null);
+
+    const progress = await indexer.getSourceProgress(
+        scope.tenantId,
+        scope.instanceId,
+        scope.source,
+    );
+    const parsed = parseSourceCursorState(progress?.cursor || null, {
+        enabled: true,
+        lowerBound: 'rez/restore-artifacts',
+    });
+
+    assert.equal(
+        parsed.scan_cursor,
+        'rez/restore-artifacts/kind=schema/930.manifest.json',
+    );
+    assert.equal(parsed.v2.by_shard['rez.cdc|0']?.next_offset, '32');
+    assert.equal(
+        parsed.v2.by_shard['rez.cdc|0']?.last_key,
+        workerBItem.manifest.artifact_key,
+    );
+    assert.equal(parsed.v2.last_reconcile_at, '2026-02-18T14:11:40.000Z');
+});
+
 test('worker logs replay scan counters for per-batch observability',
 async () => {
     const store = new InMemoryRestoreIndexStore();
@@ -622,4 +991,11 @@ async () => {
     assert.equal(payload.replay_path_selected_key_count, 1);
     assert.equal(payload.replay_only_hit_count, 1);
     assert.equal(payload.replay_cycle_ran, true);
+    assert.equal(payload.source_cursor_mode, 'mixed');
+    assert.equal(payload.version_mix_v1_count, 1);
+    assert.equal(payload.version_mix_v2_count, 0);
+    assert.equal(payload.version_mix_other_count, 0);
+    assert.equal(payload.v2_shard_advancements, 0);
+    assert.equal(payload.v2_shards_tracked, 0);
+    assert.equal(payload.v2_shard_health_parse_failed, false);
 });

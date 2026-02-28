@@ -9,6 +9,7 @@ const CONTRACT_VERSION = 'restore.contracts.v1';
 const MANIFEST_VERSION = 'rec.artifact-manifest.v1';
 const ALLOWLIST_VERSION = 'rrs.metadata.allowlist.v1';
 const KEY_LAYOUT_VERSION = 'rec.object-key-layout.v1';
+const KEY_LAYOUT_VERSION_V2 = 'rec.object-key-layout.v2';
 
 function buildValidManifest(overrides?: Record<string, unknown>) {
     return {
@@ -129,6 +130,29 @@ describe('parseManifest (tested via readBatch)', () => {
         assert.equal(batch.items.length, 1);
         assert.equal(batch.items[0].manifest.event_id, 'evt-1');
         assert.equal(batch.items[0].manifest.offset, '42');
+    });
+
+    it('accepts rec.object-key-layout.v2', async () => {
+        const manifest = buildValidManifest({
+            object_key_layout_version: KEY_LAYOUT_VERSION_V2,
+        });
+        const artifact = buildValidArtifact();
+        const manifestKey = 'rez/restore/evt-v2.manifest.json';
+        const client = createMockClient(
+            { [manifestKey]: manifest },
+            { [manifest.artifact_key]: artifact },
+        );
+        const source = createSource(client);
+        const batch = await source.readBatch({
+            cursor: null,
+            limit: 10,
+        });
+
+        assert.equal(batch.items.length, 1);
+        assert.equal(
+            batch.items[0].manifest.object_key_layout_version,
+            KEY_LAYOUT_VERSION_V2,
+        );
     });
 
     it('throws on non-object input', async () => {

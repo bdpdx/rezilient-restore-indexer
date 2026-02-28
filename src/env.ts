@@ -6,6 +6,10 @@ export type ArtifactSourceMode =
     | 'rec_manifest_object_store'
     | 'in_memory_scaffold';
 
+export type SourceCursorMode =
+    | 'mixed'
+    | 'v2_primary';
+
 export type RecManifestCursorReplayEnv = SourceCursorReplayDefaults & {
     intervalSeconds: number;
     maxKeysPerCycle: number;
@@ -15,6 +19,7 @@ export type RecManifestCursorReplayEnv = SourceCursorReplayDefaults & {
 export type RecManifestObjectStoreSourceEnv = {
     accessKeyId?: string;
     bucket: string;
+    cursorMode: SourceCursorMode;
     cursorReplay: RecManifestCursorReplayEnv;
     endpoint?: string;
     forcePathStyle: boolean;
@@ -164,6 +169,24 @@ function parseArtifactSourceMode(
     );
 }
 
+function parseSourceCursorMode(
+    value: string | undefined,
+): SourceCursorMode {
+    const normalized = readOptionalString(value) || 'mixed';
+
+    if (
+        normalized === 'mixed'
+        || normalized === 'v2_primary'
+    ) {
+        return normalized;
+    }
+
+    throw new Error(
+        'REZ_RESTORE_INDEXER_SOURCE_CURSOR_MODE must be one of '
+        + 'mixed|v2_primary when provided',
+    );
+}
+
 export function parseIndexerEnv(
     env: NodeJS.ProcessEnv,
 ): RestoreIndexerEnv {
@@ -267,6 +290,9 @@ export function parseIndexerEnv(
             bucket: readRequiredString(
                 env,
                 'REZ_RESTORE_INDEXER_SOURCE_BUCKET',
+            ),
+            cursorMode: parseSourceCursorMode(
+                env.REZ_RESTORE_INDEXER_SOURCE_CURSOR_MODE,
             ),
             cursorReplay,
             endpoint: readOptionalString(

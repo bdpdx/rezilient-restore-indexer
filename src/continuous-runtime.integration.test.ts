@@ -370,3 +370,89 @@ async () => {
 
     assert.equal(progressAfterSecondAttempt?.processed_count, 2);
 });
+
+test('continuous loop logs layout mix and v2 shard health in v2_primary mode',
+async () => {
+    const fixture = createFixture();
+    const v1Item = buildTestInput({
+        eventId: 'evt-loop-mode-v1',
+        offset: 21,
+    });
+    const v2Item = buildTestInput({
+        eventId: 'evt-loop-mode-v2',
+        offset: 22,
+    });
+
+    v2Item.manifest.object_key_layout_version = 'rec.object-key-layout.v2';
+
+    const source: ArtifactBatchSource = {
+        async readBatch() {
+            return {
+                items: [v1Item, v2Item],
+                nextCursor: 'rez/restore-artifacts/next-fast-key',
+                realtimeLagSeconds: 12,
+                scanCounters: {
+                    fastPathSelectedKeyCount: 2,
+                    replayCycleRan: false,
+                    replayOnlyHitCount: 0,
+                    replayPathSelectedKeyCount: 0,
+                },
+            };
+        },
+    };
+    const worker = new RestoreIndexerWorker(
+        source,
+        fixture.indexer,
+        5,
+        {
+            sourceCursorMode: 'v2_primary',
+            timeProvider: () => '2026-02-18T11:20:00.000Z',
+        },
+    );
+    const originalLog = console.log;
+    const originalWarn = console.warn;
+    const observedLogs: unknown[][] = [];
+    const observedWarnings: unknown[][] = [];
+
+    console.log = (...args: unknown[]) => {
+        observedLogs.push(args);
+    };
+    console.warn = (...args: unknown[]) => {
+        observedWarnings.push(args);
+    };
+
+    try {
+        const result = await worker.runOnce();
+
+        assert.equal(result.inserted, 2);
+        assert.equal(result.failures, 0);
+    } finally {
+        console.log = originalLog;
+        console.warn = originalWarn;
+    }
+
+    const batchLog = observedLogs.find((entry) => {
+        return entry[0] === 'restore-indexer batch processed';
+    });
+
+    assert.notEqual(batchLog, undefined);
+    const payload = batchLog?.[1] as Record<string, unknown>;
+
+    assert.equal(payload.source_cursor_mode, 'v2_primary');
+    assert.equal(payload.version_mix_v1_count, 1);
+    assert.equal(payload.version_mix_v2_count, 1);
+    assert.equal(payload.v2_shard_advancements, 1);
+    assert.equal(payload.v2_shards_tracked, 1);
+    assert.equal(
+        payload.v2_last_reconcile_at,
+        '2026-02-18T11:20:00.000Z',
+    );
+    assert.equal(payload.v2_primary_mode_legacy_v1_items_present, true);
+
+    const warning = observedWarnings.find((entry) => {
+        return entry[0]
+            === 'restore-indexer v2_primary observed legacy v1 manifests';
+    });
+
+    assert.notEqual(warning, undefined);
+});

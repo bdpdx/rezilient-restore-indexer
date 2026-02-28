@@ -1,5 +1,9 @@
 import { hostname as resolveHostname } from 'node:os';
-import { parseIndexerEnv, type RecManifestObjectStoreSourceEnv } from './env';
+import {
+    parseIndexerEnv,
+    type RecManifestObjectStoreSourceEnv,
+    type SourceCursorMode,
+} from './env';
 import { RestoreIndexerService } from './indexer.service';
 import {
     createS3RecManifestObjectStoreClient,
@@ -27,6 +31,7 @@ export type RuntimeSourceSummary =
         mode: 'rec_manifest_object_store';
         prefix: string;
         region: string;
+        sourceCursorMode: SourceCursorMode;
     };
 
 export type RuntimeBootstrap = {
@@ -67,6 +72,7 @@ function createRecSource(
         });
     const objectStoreClient = objectStoreClientFactory(sourceConfig);
     const source = new RecManifestArtifactBatchSource(objectStoreClient, {
+        cursorMode: sourceConfig.cursorMode,
         cursorReplay: sourceConfig.cursorReplay,
         generationId: sourceConfig.generationId,
         ingestionMode: sourceConfig.ingestionMode,
@@ -81,6 +87,7 @@ function createRecSource(
         mode: 'rec_manifest_object_store',
         prefix: sourceConfig.manifestPrefix,
         region: sourceConfig.region,
+        sourceCursorMode: sourceConfig.cursorMode,
     };
 
     return {
@@ -148,6 +155,7 @@ export function createRuntime(
                     }
                     : undefined,
                 pollIntervalMs: config.pollIntervalMs,
+                sourceCursorMode: config.recManifestSource.cursorMode,
                 sourceProgressScope: config.recManifestSource.sourceProgressScope,
             },
         );

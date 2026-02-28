@@ -108,6 +108,19 @@ test('runtime bootstrap fails closed when source mode is invalid', () => {
     }, /REZ_RESTORE_INDEXER_ARTIFACT_SOURCE must be one of/);
 });
 
+test('runtime bootstrap fails closed when source cursor mode is invalid',
+() => {
+    const env = buildRecModeEnv({
+        REZ_RESTORE_INDEXER_SOURCE_CURSOR_MODE: 'bad-mode',
+    });
+
+    assert.throws(() => {
+        createRuntime(env, {
+            createStore: () => new InMemoryRestoreIndexStore(),
+        });
+    }, /REZ_RESTORE_INDEXER_SOURCE_CURSOR_MODE must be one of/);
+});
+
 test('runtime bootstrap fails closed when required source config is missing',
 () => {
     const env = buildRecModeEnv({
@@ -183,6 +196,7 @@ async () => {
     });
 
     assert.equal(runtime.source.mode, 'rec_manifest_object_store');
+    assert.equal(runtime.source.sourceCursorMode, 'mixed');
 
     const run = await runtime.worker.runOnce();
 
@@ -278,6 +292,23 @@ async () => {
         String(cursorFailurePayload?.error_message),
         /manual_remediation=update rez_restore_index\.source_progress\.cursor/,
     );
+});
+
+test('runtime bootstrap wires source cursor mode v2_primary', () => {
+    const prefix = 'rez/restore-artifacts';
+    const mKey = `${prefix}/mode.manifest.json`;
+    const aKey = `${prefix}/mode.artifact.json`;
+    const client = new SingleBatchObjectStoreClient(mKey, aKey);
+    const runtime = createRuntime(buildRecModeEnv({
+        REZ_RESTORE_INDEXER_SOURCE_CURSOR_MODE: 'v2_primary',
+        REZ_RESTORE_INDEXER_SOURCE_PREFIX: prefix,
+    }), {
+        createObjectStoreClient: () => client,
+        createStore: () => new InMemoryRestoreIndexStore(),
+    });
+
+    assert.equal(runtime.source.mode, 'rec_manifest_object_store');
+    assert.equal(runtime.source.sourceCursorMode, 'v2_primary');
 });
 
 describe('createRuntime - additional', () => {
@@ -440,10 +471,12 @@ describe('createRuntime - additional', () => {
             mode: string;
             prefix: string;
             region: string;
+            sourceCursorMode: string;
         };
         assert.equal(source.bucket, 'rez-artifacts');
         assert.equal(source.region, 'us-east-1');
         assert.equal(source.prefix, prefix);
         assert.equal(source.endpoint, null);
+        assert.equal(source.sourceCursorMode, 'mixed');
     });
 });

@@ -18,17 +18,20 @@ Entrypoints:
   `source_coverage`, `backfill_runs`, `source_progress`,
   `source_leader_leases`).
 - `src/worker.ts`: cursor-aware batch worker with continuous polling loop,
-  fail-closed cursor advancement, source-scope leader lease gating, and
-  persisted source progress checkpoints.
+  fail-closed cursor advancement, v2 shard (`topic|partition`) progression
+  tracking, source-scope leader lease gating, persisted source progress
+  checkpoints, and per-batch v1/v2 cutover observability logs.
 - `src/rec-manifest-source.ts`: production REC manifest object-store source
-  adapter with retrying reads, deterministic key cursoring, and manifest-page
+  adapter with retrying reads, deterministic key cursoring, v1/v2 layout
+  manifest parsing, mixed vs v2-primary replay controls, and manifest-page
   scanning that avoids empty-page starvation.
 - `src/rec-manifest-object-store-client.ts`: S3-backed object-store client used
   by runtime REC manifest source wiring.
 - `src/runtime.ts`: fail-closed runtime bootstrap that selects production REC
-  source by default and allows explicit scaffold-only opt-in.
+  source by default, wires source cursor mode (`mixed|v2_primary`), and allows
+  explicit scaffold-only opt-in.
 - `doc/runbooks.md`: RS-15 operator runbooks for lag, replay/generation, and
-  freshness fail-closed incidents.
+  freshness fail-closed incidents, including DRK cutover/rollback policy.
 
 Tests:
 - `src/watermark-invariants.test.ts`
@@ -39,3 +42,4 @@ Tests:
 - `src/durability.integration.test.ts`
 - `src/continuous-runtime.integration.test.ts`
 - `src/rec-manifest-source.test.ts`
+- `src/source-cursor.test.ts`

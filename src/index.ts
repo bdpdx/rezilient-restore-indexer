@@ -41,6 +41,9 @@ async function main(): Promise<void> {
         object_store_region: source.mode === 'rec_manifest_object_store'
             ? source.region
             : null,
+        source_cursor_mode: source.mode === 'rec_manifest_object_store'
+            ? source.sourceCursorMode
+            : null,
         poll_interval_ms: config.pollIntervalMs,
         restore_pg_url_configured: Boolean(config.restorePgUrl),
         stale_after_seconds: config.staleAfterSeconds,

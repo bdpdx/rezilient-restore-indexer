@@ -49,6 +49,19 @@ function createFixture(
     };
 }
 
+function buildV2Input(
+    overrides: Parameters<typeof buildTestInput>[0] = {},
+) {
+    const input = buildTestInput(overrides);
+
+    input.manifest.object_key_layout_version = 'rec.object-key-layout.v2';
+    input.metadata.topic = input.manifest.topic;
+    input.metadata.partition = input.manifest.partition;
+    input.metadata.offset = input.manifest.offset;
+
+    return input;
+}
+
 test('restart preserves watermark, coverage, backfill, and source progress',
 async () => {
     const db = newDb();
@@ -463,6 +476,233 @@ async () => {
         assert.equal(
             cursorState.replay.last_replay_at,
             '2026-02-18T13:05:00.000Z',
+        );
+    } finally {
+        await first.close();
+
+        if (restarted) {
+            await restarted.close();
+        }
+    }
+});
+
+test('restart preserves v2 shard cursor progression across worker continuity',
+async () => {
+    const db = newDb();
+    const scope = {
+        instanceId: 'sn-dev-01',
+        source: 'sn://acme-dev.service-now.com',
+        tenantId: 'tenant-acme',
+    };
+    const first = createFixture(db);
+    let restarted: Fixture | null = null;
+    const seedItem = buildV2Input({
+        eventId: 'evt-durable-v2-seed',
+        eventTime: '2026-02-18T14:20:00.000Z',
+        offset: 50,
+        partition: 0,
+        topic: 'rez.cdc',
+    });
+    const firstRunItem = buildV2Input({
+        eventId: 'evt-durable-v2-r1',
+        eventTime: '2026-02-18T14:21:00.000Z',
+        offset: 51,
+        partition: 0,
+        topic: 'rez.cdc',
+    });
+    const resumedItem = buildV2Input({
+        eventId: 'evt-durable-v2-r2',
+        eventTime: '2026-02-18T14:22:00.000Z',
+        offset: 52,
+        partition: 0,
+        topic: 'rez.cdc',
+    });
+    const initialCursor = serializeSourceCursorState({
+        replay: {
+            enabled: true,
+            last_replay_at: '2026-02-18T14:19:00.000Z',
+            lower_bound: 'rez/restore-artifacts',
+        },
+        scan_cursor: 'rez/restore-artifacts/kind=schema/980.manifest.json',
+        v2: {
+            by_shard: {
+                'rez.cdc|0': {
+                    last_event_time: seedItem.manifest.event_time,
+                    last_key: seedItem.manifest.artifact_key,
+                    next_offset: '51',
+                },
+            },
+            last_reconcile_at: '2026-02-18T14:19:30.000Z',
+        },
+        v: SOURCE_CURSOR_VERSION,
+    });
+    const cursorAfterFirstSourceRead = serializeSourceCursorState({
+        replay: {
+            enabled: true,
+            last_replay_at: '2026-02-18T14:21:30.000Z',
+            lower_bound: 'rez/restore-artifacts',
+        },
+        scan_cursor: 'rez/restore-artifacts/kind=schema/990.manifest.json',
+        v2: {
+            by_shard: {
+                'rez.cdc|0': {
+                    last_event_time: seedItem.manifest.event_time,
+                    last_key: seedItem.manifest.artifact_key,
+                    next_offset: '51',
+                },
+            },
+            last_reconcile_at: '2026-02-18T14:19:30.000Z',
+        },
+        v: SOURCE_CURSOR_VERSION,
+    });
+
+    try {
+        await first.indexer.recordSourceProgress({
+            cursor: initialCursor,
+            instanceId: scope.instanceId,
+            lastBatchSize: 0,
+            lastIndexedEventTime: null,
+            lastIndexedOffset: null,
+            lastLagSeconds: null,
+            measuredAt: '2026-02-18T14:19:59.000Z',
+            processedDelta: 0,
+            source: scope.source,
+            tenantId: scope.tenantId,
+        });
+
+        let firstReadCursor: string | null = null;
+        const firstSource: ArtifactBatchSource = {
+            async readBatch(input) {
+                firstReadCursor = input.cursor;
+
+                return {
+                    items: [firstRunItem],
+                    nextCursor: cursorAfterFirstSourceRead,
+                    realtimeLagSeconds: 6,
+                    scanCounters: {
+                        fastPathSelectedKeyCount: 1,
+                        replayCycleRan: false,
+                        replayOnlyHitCount: 0,
+                        replayPathSelectedKeyCount: 0,
+                    },
+                };
+            },
+        };
+        const firstWorker = new RestoreIndexerWorker(
+            firstSource,
+            first.indexer,
+            10,
+            {
+                sourceProgressScope: scope,
+                timeProvider: () => '2026-02-18T14:21:45.000Z',
+            },
+        );
+        const firstRun = await firstWorker.runOnce();
+
+        assert.equal(firstRun.inserted, 1);
+        assert.equal(firstReadCursor, initialCursor);
+
+        const progressBeforeRestart = await first.indexer.getSourceProgress(
+            scope.tenantId,
+            scope.instanceId,
+            scope.source,
+        );
+        const parsedBeforeRestart = parseSourceCursorState(
+            progressBeforeRestart?.cursor || null,
+            {
+                enabled: true,
+                lowerBound: 'rez/restore-artifacts',
+            },
+        );
+
+        assert.equal(parsedBeforeRestart.v2.by_shard['rez.cdc|0']?.next_offset, '52');
+        assert.equal(
+            parsedBeforeRestart.v2.by_shard['rez.cdc|0']?.last_key,
+            firstRunItem.manifest.artifact_key,
+        );
+        assert.equal(
+            parsedBeforeRestart.v2.last_reconcile_at,
+            '2026-02-18T14:21:45.000Z',
+        );
+
+        restarted = createFixture(db);
+
+        let resumedReadCursor: string | null = null;
+        const resumedSource: ArtifactBatchSource = {
+            async readBatch(input) {
+                resumedReadCursor = input.cursor;
+                const parsed = parseSourceCursorState(input.cursor, {
+                    enabled: true,
+                    lowerBound: 'rez/restore-artifacts',
+                });
+                const nextCursor = serializeSourceCursorState({
+                    replay: {
+                        enabled: true,
+                        last_replay_at: '2026-02-18T14:22:30.000Z',
+                        lower_bound: 'rez/restore-artifacts',
+                    },
+                    scan_cursor:
+                        'rez/restore-artifacts/kind=schema/999.manifest.json',
+                    v2: parsed.v2,
+                    v: SOURCE_CURSOR_VERSION,
+                });
+
+                return {
+                    items: [resumedItem],
+                    nextCursor,
+                    realtimeLagSeconds: 4,
+                    scanCounters: {
+                        fastPathSelectedKeyCount: 1,
+                        replayCycleRan: false,
+                        replayOnlyHitCount: 0,
+                        replayPathSelectedKeyCount: 0,
+                    },
+                };
+            },
+        };
+        const resumedWorker = new RestoreIndexerWorker(
+            resumedSource,
+            restarted.indexer,
+            10,
+            {
+                sourceProgressScope: scope,
+                timeProvider: () => '2026-02-18T14:22:45.000Z',
+            },
+        );
+        const resumedRun = await resumedWorker.runOnce();
+
+        assert.equal(resumedRun.inserted, 1);
+        assert.equal(resumedReadCursor, progressBeforeRestart?.cursor || null);
+
+        const progressAfterResume = await restarted.indexer.getSourceProgress(
+            scope.tenantId,
+            scope.instanceId,
+            scope.source,
+        );
+        const parsedAfterResume = parseSourceCursorState(
+            progressAfterResume?.cursor || null,
+            {
+                enabled: true,
+                lowerBound: 'rez/restore-artifacts',
+            },
+        );
+
+        assert.equal(
+            parsedAfterResume.scan_cursor,
+            'rez/restore-artifacts/kind=schema/999.manifest.json',
+        );
+        assert.equal(parsedAfterResume.v2.by_shard['rez.cdc|0']?.next_offset, '53');
+        assert.equal(
+            parsedAfterResume.v2.by_shard['rez.cdc|0']?.last_key,
+            resumedItem.manifest.artifact_key,
+        );
+        assert.equal(
+            parsedAfterResume.v2.by_shard['rez.cdc|0']?.last_event_time,
+            resumedItem.manifest.event_time,
+        );
+        assert.equal(
+            parsedAfterResume.v2.last_reconcile_at,
+            '2026-02-18T14:22:45.000Z',
         );
     } finally {
         await first.close();

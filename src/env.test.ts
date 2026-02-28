@@ -386,6 +386,10 @@ describe('parseIndexerEnv - REC manifest source config', () => {
             'test-bucket',
         );
         assert.equal(
+            config.recManifestSource.cursorMode,
+            'mixed',
+        );
+        assert.equal(
             config.recManifestSource.region,
             'us-east-1',
         );
@@ -408,6 +412,31 @@ describe('parseIndexerEnv - REC manifest source config', () => {
         assert.equal(
             config.recManifestSource.sourceProgressScope.source,
             'sn://acme-dev.service-now.com',
+        );
+    });
+
+    it('parses SOURCE_CURSOR_MODE=v2_primary', () => {
+        const env = {
+            ...recSourceEnv(),
+            REZ_RESTORE_INDEXER_SOURCE_CURSOR_MODE: 'v2_primary',
+        };
+        const config = parseIndexerEnv(env);
+
+        assert.equal(
+            config.recManifestSource?.cursorMode,
+            'v2_primary',
+        );
+    });
+
+    it('throws on invalid SOURCE_CURSOR_MODE', () => {
+        const env = {
+            ...recSourceEnv(),
+            REZ_RESTORE_INDEXER_SOURCE_CURSOR_MODE: 'bad-mode',
+        };
+
+        assert.throws(
+            () => parseIndexerEnv(env),
+            /REZ_RESTORE_INDEXER_SOURCE_CURSOR_MODE must be one of/,
         );
     });
 
