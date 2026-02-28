@@ -3,6 +3,8 @@
 - `constants.ts`: RS-06 profile/version constants.
 - `types.ts`: indexer input/output model types.
 - `env.ts`: environment parsing helpers.
+- `source-cursor.ts`: cursor-state v2 parsing/serialization helpers with
+  legacy plain-string cursor compatibility and replay defaults.
 - `metadata.ts`: metadata allowlist validation and normalization.
 - `rec-manifest-source.ts`: object-store-backed REC manifest source adapter
   with cursor paging, retries, extended manifest-key scanning, and allowlisted
@@ -35,3 +37,4 @@
   continuous loop processing tests.
 - `rec-manifest-source.test.ts`: REC manifest source adapter pagination,
   retry, duplicate-suppression, and parsing tests.
+- `source-cursor.test.ts`: cursor-state v2 and legacy cursor contract tests.

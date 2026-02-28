@@ -7,6 +7,12 @@ import {
     RESTORE_CONTRACT_VERSION,
     RESTORE_METADATA_ALLOWLIST_VERSION,
 } from './constants';
+import {
+    parseSourceCursorState,
+    serializeSourceCursorState,
+    type SourceCursorReplayDefaults,
+    type SourceCursorV2State,
+} from './source-cursor';
 import type {
     ArtifactManifestInput,
     IndexArtifactInput,
@@ -23,6 +29,9 @@ const REC_OBJECT_KEY_LAYOUT_VERSION = 'rec.object-key-layout.v1';
 const DEFAULT_MAX_ATTEMPTS = 3;
 const DEFAULT_RETRY_BASE_MS = 200;
 const DEFAULT_LIST_PAGE_MIN_LIMIT = 100;
+const DEFAULT_REPLAY_INTERVAL_SECONDS = 60;
+const DEFAULT_REPLAY_MAX_KEYS_PER_CYCLE = 1000;
+const DEFAULT_REPLAY_MAX_PAGES_PER_CYCLE = 2;
 const MANIFEST_SUFFIX = '.manifest.json';
 
 const TRANSIENT_ERROR_CODES = new Set([
@@ -49,6 +58,13 @@ export interface RecManifestObjectStoreClient {
 }
 
 export type RecManifestArtifactBatchSourceOptions = {
+    cursorReplay?: Partial<{
+        enabled: boolean;
+        intervalSeconds: number;
+        lowerBound: string | null;
+        maxKeysPerCycle: number;
+        maxPagesPerCycle: number;
+    }>;
     generationId: string;
     ingestionMode?: IngestionMode;
     maxAttempts?: number;
@@ -145,6 +161,39 @@ function readOptionalInteger(
     }
 
     return value;
+}
+
+function readOptionalBoolean(
+    value: unknown,
+    fieldPath: string,
+): boolean | undefined {
+    if (value === undefined) {
+        return undefined;
+    }
+
+    if (typeof value !== 'boolean') {
+        throw new Error(`${fieldPath} must be a boolean when provided`);
+    }
+
+    return value;
+}
+
+function readPositiveInteger(
+    value: unknown,
+    fallback: number,
+    fieldPath: string,
+): number {
+    const parsed = readOptionalInteger(value, fieldPath);
+
+    if (parsed === undefined) {
+        return fallback;
+    }
+
+    if (parsed <= 0) {
+        throw new Error(`${fieldPath} must be a positive integer`);
+    }
+
+    return parsed;
 }
 
 function parseArtifactKind(
@@ -457,10 +506,94 @@ function isTransientObjectStoreError(error: unknown): boolean {
     return TRANSIENT_ERROR_CODES.has(code);
 }
 
+type RecManifestCursorReplayConfig = {
+    enabled: boolean;
+    intervalSeconds: number;
+    lowerBound: string | null;
+    maxKeysPerCycle: number;
+    maxPagesPerCycle: number;
+};
+
+type ManifestKeyScanOptions = {
+    lowerExclusive: string | null;
+    upperExclusive: string | null;
+};
+
+type MergedManifestSelection = {
+    selectedFastKeys: string[];
+    selectedReplayKeys: string[];
+    selectedKeys: string[];
+};
+
+function normalizeCursorReplayConfig(
+    value: RecManifestArtifactBatchSourceOptions['cursorReplay'],
+): RecManifestCursorReplayConfig {
+    const enabled = readOptionalBoolean(
+        value?.enabled,
+        'source.cursorReplay.enabled',
+    ) ?? false;
+
+    return {
+        enabled,
+        intervalSeconds: readPositiveInteger(
+            value?.intervalSeconds,
+            DEFAULT_REPLAY_INTERVAL_SECONDS,
+            'source.cursorReplay.intervalSeconds',
+        ),
+        lowerBound: value?.lowerBound === undefined
+            ? null
+            : readNullableString(
+                value.lowerBound,
+                'source.cursorReplay.lowerBound',
+            ),
+        maxKeysPerCycle: readPositiveInteger(
+            value?.maxKeysPerCycle,
+            DEFAULT_REPLAY_MAX_KEYS_PER_CYCLE,
+            'source.cursorReplay.maxKeysPerCycle',
+        ),
+        maxPagesPerCycle: readPositiveInteger(
+            value?.maxPagesPerCycle,
+            DEFAULT_REPLAY_MAX_PAGES_PER_CYCLE,
+            'source.cursorReplay.maxPagesPerCycle',
+        ),
+    };
+}
+
+function parseIsoTimeMillis(
+    value: string,
+    fieldPath: string,
+): number {
+    const parsed = Date.parse(value);
+
+    if (!Number.isFinite(parsed)) {
+        throw new Error(`${fieldPath} must be a valid ISO datetime`);
+    }
+
+    return parsed;
+}
+
+function shouldRunReplay(
+    lastReplayAt: string | null,
+    nowIsoValue: string,
+    intervalSeconds: number,
+): boolean {
+    if (lastReplayAt === null) {
+        return true;
+    }
+
+    const nowMillis = parseIsoTimeMillis(nowIsoValue, 'source now');
+    const lastReplayMillis = parseIsoTimeMillis(
+        lastReplayAt,
+        'source cursor replay.last_replay_at',
+    );
+
+    return nowMillis - lastReplayMillis >= intervalSeconds * 1000;
+}
+
 function extractManifestKeys(
     keys: string[],
     prefix: string,
-    cursor: string | null,
+    scan: ManifestKeyScanOptions,
 ): string[] {
     const filtered = new Set<string>();
     const prefixWithSlash = `${prefix}/`;
@@ -474,7 +607,11 @@ function extractManifestKeys(
             continue;
         }
 
-        if (cursor !== null && key <= cursor) {
+        if (scan.lowerExclusive !== null && key <= scan.lowerExclusive) {
+            continue;
+        }
+
+        if (scan.upperExclusive !== null && key >= scan.upperExclusive) {
             continue;
         }
 
@@ -520,6 +657,58 @@ function computeRealtimeLagSeconds(
     return Math.max(0, lagSeconds);
 }
 
+function mergeManifestSelections(input: {
+    fastKeys: string[];
+    limit: number;
+    replayKeys: string[];
+}): MergedManifestSelection {
+    const fastSelected = Array.from(new Set(input.fastKeys))
+        .sort()
+        .slice(0, input.limit);
+    const replaySorted = Array.from(new Set(input.replayKeys))
+        .sort();
+    let selectedFastKeys = fastSelected;
+    const selectedFastSet = new Set(selectedFastKeys);
+    const replayOnly = replaySorted.filter((key) => {
+        return !selectedFastSet.has(key);
+    });
+    let selectedReplayKeys: string[] = [];
+
+    if (input.limit > 0 && replayOnly.length > 0) {
+        const availableSlots = input.limit - selectedFastKeys.length;
+
+        if (availableSlots > 0) {
+            selectedReplayKeys = replayOnly.slice(-availableSlots);
+        } else if (selectedFastKeys.length > 0) {
+            selectedFastKeys = selectedFastKeys.slice(
+                0,
+                selectedFastKeys.length - 1,
+            );
+            selectedReplayKeys = [replayOnly[replayOnly.length - 1]];
+        } else {
+            selectedReplayKeys = [replayOnly[replayOnly.length - 1]];
+        }
+    }
+
+    const selectedKeys = Array.from(new Set([
+        ...selectedFastKeys,
+        ...selectedReplayKeys,
+    ]))
+        .sort()
+        .slice(0, input.limit);
+    const selectedKeySet = new Set(selectedKeys);
+
+    return {
+        selectedFastKeys: selectedFastKeys.filter((key) => {
+            return selectedKeySet.has(key);
+        }),
+        selectedReplayKeys: selectedReplayKeys.filter((key) => {
+            return selectedKeySet.has(key);
+        }),
+        selectedKeys,
+    };
+}
+
 function parseJson(
     value: string,
     fieldPath: string,
@@ -531,7 +720,65 @@ function parseJson(
     }
 }
 
+function classifyCursorKind(
+    cursor: string | null,
+): 'null' | 'empty' | 'json_like' | 'legacy_string' {
+    if (cursor === null) {
+        return 'null';
+    }
+
+    const trimmedStart = cursor.trimStart();
+
+    if (!trimmedStart) {
+        return 'empty';
+    }
+
+    return trimmedStart.startsWith('{')
+        ? 'json_like'
+        : 'legacy_string';
+}
+
+function summarizeCursorForLog(
+    cursor: string | null,
+): string {
+    if (cursor === null) {
+        return 'null';
+    }
+
+    const compact = cursor.replace(/\s+/g, ' ').trim();
+
+    if (!compact) {
+        return 'empty';
+    }
+
+    const maxLength = 180;
+
+    if (compact.length <= maxLength) {
+        return compact;
+    }
+
+    return `${compact.slice(0, maxLength)}...`;
+}
+
+function wrapCursorParseError(
+    cursor: string | null,
+    error: unknown,
+): Error {
+    const errorMessage = String((error as Error)?.message || error);
+
+    return new Error(
+        'source cursor parse failure (fail-closed): '
+        + `${errorMessage}; cursor_kind=${classifyCursorKind(cursor)}; `
+        + `cursor_preview=${summarizeCursorForLog(cursor)}; `
+        + 'manual_remediation='
+        + 'update rez_restore_index.source_progress.cursor to a valid '
+        + 'legacy string or v2 JSON payload',
+    );
+}
+
 export class RecManifestArtifactBatchSource implements ArtifactBatchSource {
+    private readonly cursorReplay: RecManifestCursorReplayConfig;
+
     private readonly generationId: string;
 
     private readonly ingestionMode: IngestionMode;
@@ -547,6 +794,8 @@ export class RecManifestArtifactBatchSource implements ArtifactBatchSource {
     private readonly tenantId: string;
 
     private readonly timeProvider: () => string;
+
+    private readonly cursorReplayDefaults: SourceCursorReplayDefaults;
 
     constructor(
         private readonly client: RecManifestObjectStoreClient,
@@ -577,6 +826,11 @@ export class RecManifestArtifactBatchSource implements ArtifactBatchSource {
             1,
             options.maxAttempts || DEFAULT_MAX_ATTEMPTS,
         );
+        this.cursorReplay = normalizeCursorReplayConfig(options.cursorReplay);
+        this.cursorReplayDefaults = {
+            enabled: this.cursorReplay.enabled,
+            lowerBound: this.cursorReplay.lowerBound,
+        };
         this.retryBaseMs = Math.max(
             10,
             options.retryBaseMs || DEFAULT_RETRY_BASE_MS,
@@ -589,47 +843,156 @@ export class RecManifestArtifactBatchSource implements ArtifactBatchSource {
         cursor: string | null;
         limit: number;
     }): Promise<ArtifactBatch> {
+        let cursorState: SourceCursorV2State;
+
+        try {
+            cursorState = parseSourceCursorState(
+                input.cursor,
+                this.cursorReplayDefaults,
+            );
+        } catch (error) {
+            throw wrapCursorParseError(input.cursor, error);
+        }
+
         if (input.limit <= 0) {
             return {
                 items: [],
-                nextCursor: input.cursor,
+                nextCursor: serializeSourceCursorState(cursorState),
                 realtimeLagSeconds: null,
+                scanCounters: {
+                    fastPathSelectedKeyCount: 0,
+                    replayCycleRan: false,
+                    replayOnlyHitCount: 0,
+                    replayPathSelectedKeyCount: 0,
+                },
             };
         }
 
-        const selectedKeys = await this.collectManifestKeys(input);
+        const nowIsoValue = this.timeProvider();
+        const selected = await this.collectManifestKeys({
+            cursorState,
+            limit: input.limit,
+            nowIsoValue,
+        });
         const items: IndexArtifactInput[] = [];
 
-        for (const manifestKey of selectedKeys) {
+        for (const manifestKey of selected.selectedKeys) {
             items.push(await this.readManifestItem(manifestKey));
         }
 
         const latestEventTime = latestManifestEventTime(items);
+        const nextCursorState: SourceCursorV2State = {
+            replay: {
+                enabled: cursorState.replay.enabled,
+                last_replay_at: selected.replayRan
+                    ? nowIsoValue
+                    : cursorState.replay.last_replay_at,
+                lower_bound: selected.replayLowerBound,
+            },
+            scan_cursor: selected.nextScanCursor,
+            v: cursorState.v,
+        };
 
         return {
             items,
-            nextCursor: selectedKeys.length > 0
-                ? selectedKeys[selectedKeys.length - 1]
-                : input.cursor,
+            nextCursor: serializeSourceCursorState(nextCursorState),
             realtimeLagSeconds: computeRealtimeLagSeconds(
                 latestEventTime,
-                this.timeProvider(),
+                nowIsoValue,
             ),
+            scanCounters: {
+                fastPathSelectedKeyCount: selected.fastPathSelectedKeyCount,
+                replayCycleRan: selected.replayRan,
+                replayOnlyHitCount: selected.replayOnlyHitCount,
+                replayPathSelectedKeyCount: selected.replayPathSelectedKeyCount,
+            },
         };
     }
 
     private async collectManifestKeys(input: {
-        cursor: string | null;
+        cursorState: SourceCursorV2State;
         limit: number;
+        nowIsoValue: string;
+    }): Promise<{
+        fastPathSelectedKeyCount: number;
+        nextScanCursor: string | null;
+        replayOnlyHitCount: number;
+        replayLowerBound: string | null;
+        replayRan: boolean;
+        replayPathSelectedKeyCount: number;
+        selectedKeys: string[];
+    }> {
+        const fastKeys = await this.listManifestKeys({
+            lowerExclusive: input.cursorState.scan_cursor,
+            maxKeys: input.limit,
+            startAfter: input.cursorState.scan_cursor,
+            upperExclusive: null,
+        });
+        const replayLowerBound = this.resolveReplayLowerBound(
+            input.cursorState,
+            fastKeys[0] || null,
+        );
+        let replayKeys: string[] = [];
+        let replayRan = false;
+
+        if (this.shouldRunReplayCycle(
+            input.cursorState,
+            replayLowerBound,
+            input.nowIsoValue,
+        )) {
+            replayKeys = await this.listManifestKeys({
+                lowerExclusive: replayLowerBound,
+                maxKeys: this.cursorReplay.maxKeysPerCycle,
+                maxPages: this.cursorReplay.maxPagesPerCycle,
+                startAfter: replayLowerBound,
+                upperExclusive: input.cursorState.scan_cursor,
+            });
+            replayRan = true;
+        }
+
+        const merged = mergeManifestSelections({
+            fastKeys,
+            limit: input.limit,
+            replayKeys,
+        });
+        const nextScanCursor = merged.selectedFastKeys.length > 0
+            ? merged.selectedFastKeys[merged.selectedFastKeys.length - 1]
+            : input.cursorState.scan_cursor;
+
+        return {
+            fastPathSelectedKeyCount: merged.selectedFastKeys.length,
+            nextScanCursor,
+            replayOnlyHitCount: merged.selectedReplayKeys.length,
+            replayLowerBound,
+            replayRan,
+            replayPathSelectedKeyCount: merged.selectedReplayKeys.length,
+            selectedKeys: merged.selectedKeys,
+        };
+    }
+
+    private async listManifestKeys(input: {
+        lowerExclusive: string | null;
+        maxKeys: number;
+        maxPages?: number;
+        startAfter: string | null;
+        upperExclusive: string | null;
     }): Promise<string[]> {
         const selected = new Set<string>();
         const pageLimit = Math.max(
             DEFAULT_LIST_PAGE_MIN_LIMIT,
-            input.limit * 4,
+            Math.min(input.maxKeys * 4, 5000),
         );
-        let searchCursor = input.cursor;
+        let searchCursor = input.startAfter;
+        let pagesRead = 0;
 
-        while (selected.size < input.limit) {
+        while (selected.size < input.maxKeys) {
+            if (
+                input.maxPages !== undefined
+                && pagesRead >= input.maxPages
+            ) {
+                break;
+            }
+
             const listedKeys = await this.withRetry(
                 'listObjectKeys',
                 undefined,
@@ -642,6 +1005,8 @@ export class RecManifestArtifactBatchSource implements ArtifactBatchSource {
                 },
             );
 
+            pagesRead += 1;
+
             if (listedKeys.length === 0) {
                 break;
             }
@@ -651,13 +1016,16 @@ export class RecManifestArtifactBatchSource implements ArtifactBatchSource {
             const pageManifestKeys = extractManifestKeys(
                 uniqueSortedPageKeys,
                 this.prefix,
-                input.cursor,
+                {
+                    lowerExclusive: input.lowerExclusive,
+                    upperExclusive: input.upperExclusive,
+                },
             );
 
             for (const manifestKey of pageManifestKeys) {
                 selected.add(manifestKey);
 
-                if (selected.size >= input.limit) {
+                if (selected.size >= input.maxKeys) {
                     break;
                 }
             }
@@ -682,7 +1050,52 @@ export class RecManifestArtifactBatchSource implements ArtifactBatchSource {
 
         return Array.from(selected)
             .sort()
-            .slice(0, input.limit);
+            .slice(0, input.maxKeys);
+    }
+
+    private resolveReplayLowerBound(
+        cursorState: SourceCursorV2State,
+        firstFastKey: string | null,
+    ): string | null {
+        if (cursorState.replay.lower_bound !== null) {
+            return cursorState.replay.lower_bound;
+        }
+
+        if (cursorState.scan_cursor !== null) {
+            return this.prefix;
+        }
+
+        return firstFastKey;
+    }
+
+    private shouldRunReplayCycle(
+        cursorState: SourceCursorV2State,
+        replayLowerBound: string | null,
+        nowIsoValue: string,
+    ): boolean {
+        if (
+            !cursorState.replay.enabled
+            || !this.cursorReplay.enabled
+        ) {
+            return false;
+        }
+
+        if (
+            cursorState.scan_cursor === null
+            || replayLowerBound === null
+        ) {
+            return false;
+        }
+
+        if (replayLowerBound >= cursorState.scan_cursor) {
+            return false;
+        }
+
+        return shouldRunReplay(
+            cursorState.replay.last_replay_at,
+            nowIsoValue,
+            this.cursorReplay.intervalSeconds,
+        );
     }
 
     private async readManifestItem(

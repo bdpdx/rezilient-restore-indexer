@@ -1,9 +1,15 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { RestoreIndexerService } from './indexer.service';
+import {
+    parseSourceCursorState,
+    serializeSourceCursorState,
+    SOURCE_CURSOR_VERSION,
+} from './source-cursor';
 import { InMemoryRestoreIndexStore } from './store';
 import { buildTestInput } from './test-helpers';
 import {
+    type ArtifactBatchSource,
     InMemoryArtifactBatchSource,
     RestoreIndexerWorker,
 } from './worker';
@@ -144,6 +150,117 @@ async () => {
     assert.notEqual(progress, null);
     assert.equal(progress?.processed_count, 3);
     assert.equal(progress?.last_lag_seconds, 420);
+});
+
+test('continuous loop advances with replay-only batches and v2 cursor state',
+async () => {
+    const scope = {
+        instanceId: 'sn-dev-01',
+        source: 'sn://acme-dev.service-now.com',
+        tenantId: 'tenant-acme',
+    };
+    const fixture = createFixture();
+    const afterFastCursor = serializeSourceCursorState({
+        replay: {
+            enabled: true,
+            last_replay_at: '2026-02-18T11:20:00.000Z',
+            lower_bound: 'rez/restore-artifacts',
+        },
+        scan_cursor: 'rez/restore-artifacts/kind=schema/900.manifest.json',
+        v: SOURCE_CURSOR_VERSION,
+    });
+    const afterReplayCursor = serializeSourceCursorState({
+        replay: {
+            enabled: true,
+            last_replay_at: '2026-02-18T11:21:00.000Z',
+            lower_bound: 'rez/restore-artifacts',
+        },
+        scan_cursor: 'rez/restore-artifacts/kind=schema/900.manifest.json',
+        v: SOURCE_CURSOR_VERSION,
+    });
+    const observedCursors: Array<string | null> = [];
+    let readCalls = 0;
+    const source: ArtifactBatchSource = {
+        async readBatch(input) {
+            observedCursors.push(input.cursor);
+            readCalls += 1;
+
+            if (readCalls === 1) {
+                return {
+                    items: [buildTestInput({
+                        eventId: 'evt-loop-replay-fast-1',
+                        offset: 300,
+                    })],
+                    nextCursor: afterFastCursor,
+                    realtimeLagSeconds: 90,
+                    scanCounters: {
+                        fastPathSelectedKeyCount: 1,
+                        replayCycleRan: false,
+                        replayOnlyHitCount: 0,
+                        replayPathSelectedKeyCount: 0,
+                    },
+                };
+            }
+
+            return {
+                items: [buildTestInput({
+                    eventId: 'evt-loop-replay-hit-1',
+                    offset: 301,
+                })],
+                nextCursor: afterReplayCursor,
+                realtimeLagSeconds: 30,
+                scanCounters: {
+                    fastPathSelectedKeyCount: 0,
+                    replayCycleRan: true,
+                    replayOnlyHitCount: 1,
+                    replayPathSelectedKeyCount: 1,
+                },
+            };
+        },
+    };
+    const worker = new RestoreIndexerWorker(
+        source,
+        fixture.indexer,
+        1,
+        {
+            pollIntervalMs: 1,
+            sleep: async () => Promise.resolve(),
+            sourceProgressScope: scope,
+            timeProvider: () => '2026-02-18T11:21:30.000Z',
+        },
+    );
+    const summary = await worker.runContinuously({
+        maxCycles: 2,
+    });
+
+    assert.equal(summary.cycles, 2);
+    assert.equal(summary.inserted, 2);
+    assert.equal(summary.failures, 0);
+    assert.deepEqual(observedCursors, [null, afterFastCursor]);
+
+    const progress = await fixture.indexer.getSourceProgress(
+        scope.tenantId,
+        scope.instanceId,
+        scope.source,
+    );
+
+    assert.notEqual(progress, null);
+    assert.equal(progress?.cursor, afterReplayCursor);
+    assert.equal(progress?.processed_count, 2);
+
+    const cursorState = parseSourceCursorState(progress?.cursor || null, {
+        enabled: true,
+        lowerBound: 'rez/restore-artifacts',
+    });
+
+    assert.equal(
+        cursorState.scan_cursor,
+        'rez/restore-artifacts/kind=schema/900.manifest.json',
+    );
+    assert.equal(
+        cursorState.replay.last_replay_at,
+        '2026-02-18T11:21:00.000Z',
+    );
 });
 
 test('continuous loop normalizes source progress event time to millis',

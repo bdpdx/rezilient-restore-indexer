@@ -15,6 +15,68 @@
 5. Operators should treat repeated cursor pinning as an indexing incident and
    resolve the bad artifact/metadata before expecting forward progress.
 
+## 0. Cursor Health Checks and Replay Interpretation
+
+1. Query source progress for the affected source scope:
+
+```sql
+SELECT
+    tenant_id,
+    instance_id,
+    source,
+    cursor,
+    last_batch_size,
+    last_indexed_event_time,
+    last_indexed_offset,
+    last_lag_seconds,
+    processed_count,
+    updated_at
+FROM rez_restore_index.source_progress
+WHERE tenant_id = '<tenant_id>'
+  AND instance_id = '<instance_id>'
+  AND source = '<source_uri>';
+```
+
+2. Cursor health expectations:
+   - `cursor` should be either:
+     - legacy plain key string (backward compatibility), or
+     - v2 JSON with `scan_cursor` and `replay` fields.
+   - `updated_at` and `processed_count` should continue to move during active
+     ingest windows.
+3. Batch log interpretation (`restore-indexer batch processed`):
+   - `fast_path_selected_key_count`: keys selected from scan cursor path.
+   - `replay_path_selected_key_count`: keys selected from replay path.
+   - `replay_only_hit_count`: keys found only by replay (expected during
+     lexically-lower late arrivals).
+   - `replay_cycle_ran=true` with non-zero replay hits indicates replay is
+     recovering keys that scan cursor alone would miss.
+4. Healthy progression signal:
+   - `last_indexed_event_time` and `last_indexed_offset` advance over time.
+   - replay counters may be zero on normal cycles and non-zero on late-key
+     cycles.
+   - temporary cursor pinning is acceptable only when failures are present in
+     the same batch.
+
+## 0.1 Malformed Cursor Fail-Closed Remediation
+
+1. When cursor parsing fails, worker logs:
+   - `restore-indexer source cursor parse failed; failing closed`
+   - diagnostic fields include `cursor_kind`, `cursor_preview`,
+     and `manual_remediation` guidance.
+2. Parse failures are fail-closed by design:
+   - no new batch is indexed,
+   - source progress cursor is not advanced.
+3. Manual intervention is warranted when either condition is true:
+   - repeated parse-failure logs for the same source scope, or
+   - `source_progress.updated_at` and `processed_count` stall while new REC
+     manifests are known to exist.
+4. Remediation procedure:
+   - snapshot the current `source_progress` row for incident records,
+   - replace `cursor` with either a valid legacy key string or valid v2 JSON,
+   - restart/recover worker and confirm batch progression resumes.
+5. Do not use broad cursor resets as first response if parse errors are not
+   present; prefer diagnosing artifact/indexing failures first.
+
 ## 1. Sidecar Lag / Freshness Breach
 
 1. Query freshness status in restore admin:

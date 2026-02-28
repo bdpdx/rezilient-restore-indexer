@@ -4,6 +4,11 @@ import {
     RecManifestArtifactBatchSource,
     type RecManifestObjectStoreClient,
 } from './rec-manifest-source';
+import {
+    parseSourceCursorState,
+    serializeSourceCursorState,
+    SOURCE_CURSOR_VERSION,
+} from './source-cursor';
 
 type ListStep = {
     error?: Error;
@@ -186,6 +191,19 @@ function buildCdcArtifact(params: {
     };
 }
 
+const CURSOR_DEFAULTS = {
+    enabled: false,
+    lowerBound: null,
+};
+
+function readCursorState(
+    cursor: string | null,
+) {
+    assert.notEqual(cursor, null);
+
+    return parseSourceCursorState(cursor, CURSOR_DEFAULTS);
+}
+
 test('rec manifest source paginates deterministically with cursor progress',
 async () => {
     const prefix = 'rez/restore-artifacts';
@@ -289,7 +307,10 @@ async () => {
     assert.equal(first.items.length, 2);
     assert.equal(first.items[0]?.manifest.event_id, 'evt-001');
     assert.equal(first.items[1]?.manifest.event_id, 'evt-002');
-    assert.equal(first.nextCursor, manifest002);
+    assert.equal(
+        readCursorState(first.nextCursor).scan_cursor,
+        manifest002,
+    );
     assert.equal(first.realtimeLagSeconds, 70);
 
     const second = await source.readBatch({
@@ -299,7 +320,10 @@ async () => {
 
     assert.equal(second.items.length, 1);
     assert.equal(second.items[0]?.manifest.event_id, 'evt-003');
-    assert.equal(second.nextCursor, manifest003);
+    assert.equal(
+        readCursorState(second.nextCursor).scan_cursor,
+        manifest003,
+    );
 
     const third = await source.readBatch({
         cursor: second.nextCursor,
@@ -307,7 +331,10 @@ async () => {
     });
 
     assert.equal(third.items.length, 0);
-    assert.equal(third.nextCursor, manifest003);
+    assert.equal(
+        readCursorState(third.nextCursor).scan_cursor,
+        manifest003,
+    );
     assert.equal(third.realtimeLagSeconds, null);
 
     assert.deepEqual(
@@ -377,7 +404,10 @@ async () => {
 
     assert.equal(batch.items.length, 1);
     assert.equal(batch.items[0]?.manifest.event_id, 'evt-scan-001');
-    assert.equal(batch.nextCursor, manifestKey001);
+    assert.equal(
+        readCursorState(batch.nextCursor).scan_cursor,
+        manifestKey001,
+    );
     assert.equal(client.listCalls.length, 2);
     assert.equal(client.listCalls[0]?.startAfter, null);
     assert.equal(
@@ -599,4 +629,370 @@ async () => {
     assert.equal('non_allowlisted' in (item?.metadata || {}), false);
     assert.equal('row' in (item?.metadata || {}), false);
     assert.equal('snapshot' in (item?.metadata || {}), false);
+});
+
+test('rec manifest source discovers late lexically-lower keys via replay',
+async () => {
+    const prefix = 'rez/restore-artifacts';
+    const replayLowerBound = manifestKey(prefix, '090');
+    const scanCursor = manifestKey(prefix, '300');
+    const lateManifest = manifestKey(prefix, '120');
+    const lateArtifact = artifactKey(prefix, '120');
+    const client = new ScriptedObjectStoreClient([
+        {
+            keys: [],
+        },
+        {
+            keys: [lateManifest],
+        },
+    ], new Map([
+        [
+            lateManifest,
+            [{
+                body: JSON.stringify(buildManifest({
+                    artifactKey: lateArtifact,
+                    eventId: 'evt-late-120',
+                    eventTime: '2026-02-18T14:00:00.000Z',
+                    offset: '120',
+                })),
+            }],
+        ],
+        [
+            lateArtifact,
+            [{
+                body: JSON.stringify(buildCdcArtifact({
+                    eventId: 'evt-late-120',
+                    eventTime: '2026-02-18T14:00:00.000Z',
+                })),
+            }],
+        ],
+    ]));
+    const source = new RecManifestArtifactBatchSource(client, {
+        cursorReplay: {
+            enabled: true,
+            intervalSeconds: 60,
+            lowerBound: replayLowerBound,
+            maxKeysPerCycle: 100,
+            maxPagesPerCycle: 2,
+        },
+        generationId: 'gen-rec',
+        prefix,
+        tenantId: 'tenant-acme',
+        timeProvider: () => '2026-02-18T14:01:00.000Z',
+    });
+    const cursor = serializeSourceCursorState({
+        replay: {
+            enabled: true,
+            last_replay_at: null,
+            lower_bound: replayLowerBound,
+        },
+        scan_cursor: scanCursor,
+        v: SOURCE_CURSOR_VERSION,
+    });
+    const batch = await source.readBatch({
+        cursor,
+        limit: 2,
+    });
+
+    assert.equal(batch.items.length, 1);
+    assert.equal(batch.items[0]?.manifest.event_id, 'evt-late-120');
+    assert.equal(batch.scanCounters?.fastPathSelectedKeyCount, 0);
+    assert.equal(batch.scanCounters?.replayPathSelectedKeyCount, 1);
+    assert.equal(batch.scanCounters?.replayOnlyHitCount, 1);
+    assert.equal(batch.scanCounters?.replayCycleRan, true);
+    assert.equal(client.listCalls.length, 2);
+    assert.equal(client.listCalls[0]?.startAfter, scanCursor);
+    assert.equal(client.listCalls[1]?.startAfter, replayLowerBound);
+
+    const nextCursor = readCursorState(batch.nextCursor);
+
+    assert.equal(nextCursor.scan_cursor, scanCursor);
+    assert.equal(nextCursor.replay.lower_bound, replayLowerBound);
+    assert.equal(
+        nextCursor.replay.last_replay_at,
+        '2026-02-18T14:01:00.000Z',
+    );
+});
+
+test('rec manifest source enforces replay page/key caps', async () => {
+    const prefix = 'rez/restore-artifacts';
+    const replayLowerBound = manifestKey(prefix, '050');
+    const scanCursor = manifestKey(prefix, '500');
+    const manifest110 = manifestKey(prefix, '110');
+    const artifact110 = artifactKey(prefix, '110');
+    const manifest120 = manifestKey(prefix, '120');
+    const artifact120 = artifactKey(prefix, '120');
+    const manifest130 = manifestKey(prefix, '130');
+    const manifest140 = manifestKey(prefix, '140');
+    const client = new ScriptedObjectStoreClient([
+        {
+            keys: [],
+        },
+        {
+            keys: [
+                manifest140,
+                manifest120,
+                manifest110,
+                manifest130,
+            ],
+        },
+    ], new Map([
+        [
+            manifest110,
+            [{
+                body: JSON.stringify(buildManifest({
+                    artifactKey: artifact110,
+                    eventId: 'evt-110',
+                    eventTime: '2026-02-18T15:00:00.000Z',
+                    offset: '110',
+                })),
+            }],
+        ],
+        [
+            artifact110,
+            [{
+                body: JSON.stringify(buildCdcArtifact({
+                    eventId: 'evt-110',
+                    eventTime: '2026-02-18T15:00:00.000Z',
+                })),
+            }],
+        ],
+        [
+            manifest120,
+            [{
+                body: JSON.stringify(buildManifest({
+                    artifactKey: artifact120,
+                    eventId: 'evt-120',
+                    eventTime: '2026-02-18T15:00:10.000Z',
+                    offset: '120',
+                })),
+            }],
+        ],
+        [
+            artifact120,
+            [{
+                body: JSON.stringify(buildCdcArtifact({
+                    eventId: 'evt-120',
+                    eventTime: '2026-02-18T15:00:10.000Z',
+                })),
+            }],
+        ],
+    ]));
+    const source = new RecManifestArtifactBatchSource(client, {
+        cursorReplay: {
+            enabled: true,
+            intervalSeconds: 60,
+            lowerBound: replayLowerBound,
+            maxKeysPerCycle: 2,
+            maxPagesPerCycle: 1,
+        },
+        generationId: 'gen-rec',
+        prefix,
+        tenantId: 'tenant-acme',
+    });
+    const cursor = serializeSourceCursorState({
+        replay: {
+            enabled: true,
+            last_replay_at: null,
+            lower_bound: replayLowerBound,
+        },
+        scan_cursor: scanCursor,
+        v: SOURCE_CURSOR_VERSION,
+    });
+    const batch = await source.readBatch({
+        cursor,
+        limit: 10,
+    });
+
+    assert.equal(batch.items.length, 2);
+    assert.deepEqual(
+        batch.items.map((item) => {
+            return item.manifest.event_id;
+        }),
+        [
+            'evt-110',
+            'evt-120',
+        ],
+    );
+    assert.equal(client.listCalls.length, 2);
+    assert.equal(client.listCalls[0]?.startAfter, scanCursor);
+    assert.equal(client.listCalls[1]?.startAfter, replayLowerBound);
+});
+
+test('rec manifest source merges fast and replay keys deterministically',
+async () => {
+    const prefix = 'rez/restore-artifacts';
+    const replayLowerBound = manifestKey(prefix, '050');
+    const scanCursor = manifestKey(prefix, '100');
+    const replayManifest = manifestKey(prefix, '090');
+    const replayArtifact = artifactKey(prefix, '090');
+    const fastManifest120 = manifestKey(prefix, '120');
+    const fastArtifact120 = artifactKey(prefix, '120');
+    const fastManifest130 = manifestKey(prefix, '130');
+    const fastArtifact130 = artifactKey(prefix, '130');
+    const client = new ScriptedObjectStoreClient([
+        {
+            keys: [fastManifest130, fastManifest120],
+        },
+        {
+            keys: [replayManifest],
+        },
+    ], new Map([
+        [
+            replayManifest,
+            [{
+                body: JSON.stringify(buildManifest({
+                    artifactKey: replayArtifact,
+                    eventId: 'evt-replay-090',
+                    eventTime: '2026-02-18T16:00:00.000Z',
+                    offset: '90',
+                })),
+            }],
+        ],
+        [
+            replayArtifact,
+            [{
+                body: JSON.stringify(buildCdcArtifact({
+                    eventId: 'evt-replay-090',
+                    eventTime: '2026-02-18T16:00:00.000Z',
+                })),
+            }],
+        ],
+        [
+            fastManifest120,
+            [{
+                body: JSON.stringify(buildManifest({
+                    artifactKey: fastArtifact120,
+                    eventId: 'evt-fast-120',
+                    eventTime: '2026-02-18T16:00:10.000Z',
+                    offset: '120',
+                })),
+            }],
+        ],
+        [
+            fastArtifact120,
+            [{
+                body: JSON.stringify(buildCdcArtifact({
+                    eventId: 'evt-fast-120',
+                    eventTime: '2026-02-18T16:00:10.000Z',
+                })),
+            }],
+        ],
+        [
+            fastManifest130,
+            [{
+                body: JSON.stringify(buildManifest({
+                    artifactKey: fastArtifact130,
+                    eventId: 'evt-fast-130',
+                    eventTime: '2026-02-18T16:00:20.000Z',
+                    offset: '130',
+                })),
+            }],
+        ],
+        [
+            fastArtifact130,
+            [{
+                body: JSON.stringify(buildCdcArtifact({
+                    eventId: 'evt-fast-130',
+                    eventTime: '2026-02-18T16:00:20.000Z',
+                })),
+            }],
+        ],
+    ]));
+    const source = new RecManifestArtifactBatchSource(client, {
+        cursorReplay: {
+            enabled: true,
+            intervalSeconds: 60,
+            lowerBound: replayLowerBound,
+            maxKeysPerCycle: 100,
+            maxPagesPerCycle: 2,
+        },
+        generationId: 'gen-rec',
+        prefix,
+        tenantId: 'tenant-acme',
+    });
+    const cursor = serializeSourceCursorState({
+        replay: {
+            enabled: true,
+            last_replay_at: null,
+            lower_bound: replayLowerBound,
+        },
+        scan_cursor: scanCursor,
+        v: SOURCE_CURSOR_VERSION,
+    });
+    const batch = await source.readBatch({
+        cursor,
+        limit: 2,
+    });
+
+    assert.deepEqual(
+        batch.items.map((item) => {
+            return item.manifest.event_id;
+        }),
+        [
+            'evt-replay-090',
+            'evt-fast-120',
+        ],
+    );
+    assert.equal(batch.scanCounters?.fastPathSelectedKeyCount, 1);
+    assert.equal(batch.scanCounters?.replayPathSelectedKeyCount, 1);
+    assert.equal(batch.scanCounters?.replayOnlyHitCount, 1);
+    assert.equal(batch.scanCounters?.replayCycleRan, true);
+
+    const nextCursor = readCursorState(batch.nextCursor);
+
+    assert.equal(nextCursor.scan_cursor, fastManifest120);
+});
+
+test('rec manifest source upgrades legacy cursor to v2 payload', async () => {
+    const legacyCursor = 'rez/restore-artifacts/legacy-scan.manifest.json';
+    const source = new RecManifestArtifactBatchSource(
+        new ScriptedObjectStoreClient([], new Map()),
+        {
+            generationId: 'gen-rec',
+            prefix: 'rez/restore-artifacts',
+            tenantId: 'tenant-acme',
+        },
+    );
+    const batch = await source.readBatch({
+        cursor: legacyCursor,
+        limit: 1,
+    });
+    const nextCursor = readCursorState(batch.nextCursor);
+
+    assert.equal(nextCursor.scan_cursor, legacyCursor);
+    assert.equal(nextCursor.replay.enabled, false);
+});
+
+test('rec manifest source fails closed on malformed v2 cursor with diagnostics',
+async () => {
+    const source = new RecManifestArtifactBatchSource(
+        new ScriptedObjectStoreClient([], new Map()),
+        {
+            generationId: 'gen-rec',
+            prefix: 'rez/restore-artifacts',
+            tenantId: 'tenant-acme',
+        },
+    );
+
+    await assert.rejects(async () => {
+        await source.readBatch({
+            cursor: '{"v":2,"scan_cursor":"scan-key","replay":',
+            limit: 1,
+        });
+    }, (error: unknown) => {
+        const message = String((error as Error)?.message || error);
+
+        assert.match(
+            message,
+            /source cursor parse failure \(fail-closed\):/,
+        );
+        assert.match(message, /cursor_kind=json_like/);
+        assert.match(
+            message,
+            /manual_remediation=update rez_restore_index\.source_progress\.cursor/,
+        );
+
+        return true;
+    });
 });

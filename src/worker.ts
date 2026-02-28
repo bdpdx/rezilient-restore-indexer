@@ -9,6 +9,14 @@ export type ArtifactBatch = {
     items: IndexArtifactInput[];
     nextCursor: string | null;
     realtimeLagSeconds: number | null;
+    scanCounters?: ArtifactBatchScanCounters;
+};
+
+export type ArtifactBatchScanCounters = {
+    fastPathSelectedKeyCount: number;
+    replayCycleRan: boolean;
+    replayOnlyHitCount: number;
+    replayPathSelectedKeyCount: number;
 };
 
 export interface ArtifactBatchSource {
@@ -169,6 +177,55 @@ function latestOffset(
     return latest;
 }
 
+function defaultScanCounters(): ArtifactBatchScanCounters {
+    return {
+        fastPathSelectedKeyCount: 0,
+        replayCycleRan: false,
+        replayOnlyHitCount: 0,
+        replayPathSelectedKeyCount: 0,
+    };
+}
+
+function classifyCursorKind(
+    cursor: string | null,
+): 'null' | 'empty' | 'json_like' | 'legacy_string' {
+    if (cursor === null) {
+        return 'null';
+    }
+
+    const trimmed = cursor.trimStart();
+
+    if (!trimmed) {
+        return 'empty';
+    }
+
+    return trimmed.startsWith('{')
+        ? 'json_like'
+        : 'legacy_string';
+}
+
+function summarizeCursor(
+    cursor: string | null,
+): string {
+    if (cursor === null) {
+        return 'null';
+    }
+
+    const compact = cursor.replace(/\s+/g, ' ').trim();
+
+    if (!compact) {
+        return 'empty';
+    }
+
+    const maxLength = 180;
+
+    if (compact.length <= maxLength) {
+        return compact;
+    }
+
+    return `${compact.slice(0, maxLength)}...`;
+}
+
 export class RestoreIndexerWorker {
     private cursor: string | null = null;
 
@@ -249,10 +306,19 @@ export class RestoreIndexerWorker {
 
         await this.loadCursorIfNeeded();
 
-        const batch = await this.source.readBatch({
-            cursor: this.cursor,
-            limit: this.batchSize,
-        });
+        const previousCursor = this.cursor;
+        let batch: ArtifactBatch;
+
+        try {
+            batch = await this.source.readBatch({
+                cursor: this.cursor,
+                limit: this.batchSize,
+            });
+        } catch (error) {
+            this.logSourceCursorFailure(previousCursor, error);
+            throw error;
+        }
+
         const result = await this.indexer.processBatch(batch.items);
         const advanceCursor = result.failures === 0;
         const nextCursor = advanceCursor
@@ -264,6 +330,11 @@ export class RestoreIndexerWorker {
         await this.persistSourceProgress(batch, result, {
             advanceCursor,
             nextCursor,
+        });
+        this.logBatchOutcome(batch, result, {
+            advanceCursor,
+            nextCursor,
+            previousCursor,
         });
 
         return {
@@ -428,6 +499,58 @@ export class RestoreIndexerWorker {
             tenantId: this.sourceProgressScope.tenantId,
         });
     }
+
+    private logBatchOutcome(
+        batch: ArtifactBatch,
+        result: ProcessBatchResult,
+        cursor: {
+            advanceCursor: boolean;
+            nextCursor: string | null;
+            previousCursor: string | null;
+        },
+    ): void {
+        const scanCounters = batch.scanCounters || defaultScanCounters();
+
+        console.log('restore-indexer batch processed', {
+            advance_cursor: cursor.advanceCursor,
+            batch_size: batch.items.length,
+            cursor_after: cursor.nextCursor,
+            cursor_before: cursor.previousCursor,
+            existing: result.existing,
+            failures: result.failures,
+            fast_path_selected_key_count:
+                scanCounters.fastPathSelectedKeyCount,
+            inserted: result.inserted,
+            realtime_lag_seconds: batch.realtimeLagSeconds,
+            replay_cycle_ran: scanCounters.replayCycleRan,
+            replay_only_hit_count: scanCounters.replayOnlyHitCount,
+            replay_path_selected_key_count:
+                scanCounters.replayPathSelectedKeyCount,
+        });
+    }
+
+    private logSourceCursorFailure(
+        cursor: string | null,
+        error: unknown,
+    ): void {
+        const errorMessage = String((error as Error)?.message || error);
+
+        if (!errorMessage.includes('source cursor parse failure')) {
+            return;
+        }
+
+        console.error(
+            'restore-indexer source cursor parse failed; failing closed',
+            {
+                cursor_kind: classifyCursorKind(cursor),
+                cursor_preview: summarizeCursor(cursor),
+                error_message: errorMessage,
+                instance_id: this.sourceProgressScope?.instanceId || null,
+                source: this.sourceProgressScope?.source || null,
+                tenant_id: this.sourceProgressScope?.tenantId || null,
+            },
+        );
+    }
 }
 
 export class InMemoryArtifactBatchSource implements ArtifactBatchSource {
@@ -472,6 +595,12 @@ export class InMemoryArtifactBatchSource implements ArtifactBatchSource {
             items: this.queue.slice(boundedStart, boundedEnd),
             nextCursor: String(boundedEnd),
             realtimeLagSeconds: this.realtimeLagSeconds,
+            scanCounters: {
+                fastPathSelectedKeyCount: boundedEnd - boundedStart,
+                replayCycleRan: false,
+                replayOnlyHitCount: 0,
+                replayPathSelectedKeyCount: 0,
+            },
         };
     }
 }

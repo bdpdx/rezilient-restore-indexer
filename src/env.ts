@@ -1,13 +1,21 @@
 import type { IngestionMode } from './types';
+import type { SourceCursorReplayDefaults } from './source-cursor';
 import type { SourceProgressScope } from './worker';
 
 export type ArtifactSourceMode =
     | 'rec_manifest_object_store'
     | 'in_memory_scaffold';
 
+export type RecManifestCursorReplayEnv = SourceCursorReplayDefaults & {
+    intervalSeconds: number;
+    maxKeysPerCycle: number;
+    maxPagesPerCycle: number;
+};
+
 export type RecManifestObjectStoreSourceEnv = {
     accessKeyId?: string;
     bucket: string;
+    cursorReplay: RecManifestCursorReplayEnv;
     endpoint?: string;
     forcePathStyle: boolean;
     generationId: string;
@@ -220,6 +228,28 @@ export function parseIndexerEnv(
         const tenantId = readOptionalString(
             env.REZ_RESTORE_INDEXER_SOURCE_TENANT_ID,
         ) || defaultTenant;
+        const cursorReplay: RecManifestCursorReplayEnv = {
+            enabled: parseBoolean(
+                env.REZ_RESTORE_INDEXER_SOURCE_REPLAY_ENABLED,
+                true,
+                'REZ_RESTORE_INDEXER_SOURCE_REPLAY_ENABLED',
+            ),
+            intervalSeconds: parsePositiveInt(
+                env.REZ_RESTORE_INDEXER_SOURCE_REPLAY_INTERVAL_SECONDS,
+                60,
+            ),
+            lowerBound: readOptionalString(
+                env.REZ_RESTORE_INDEXER_SOURCE_REPLAY_LOWER_BOUND,
+            ) || null,
+            maxKeysPerCycle: parsePositiveInt(
+                env.REZ_RESTORE_INDEXER_SOURCE_REPLAY_MAX_KEYS_PER_CYCLE,
+                1000,
+            ),
+            maxPagesPerCycle: parsePositiveInt(
+                env.REZ_RESTORE_INDEXER_SOURCE_REPLAY_MAX_PAGES_PER_CYCLE,
+                2,
+            ),
+        };
         const sourceProgressScope: SourceProgressScope = {
             instanceId: readRequiredString(
                 env,
@@ -238,6 +268,7 @@ export function parseIndexerEnv(
                 env,
                 'REZ_RESTORE_INDEXER_SOURCE_BUCKET',
             ),
+            cursorReplay,
             endpoint: readOptionalString(
                 env.REZ_RESTORE_INDEXER_SOURCE_ENDPOINT,
             ),

@@ -578,6 +578,86 @@ describe('parseIndexerEnv - REC manifest source config', () => {
         assert.equal(config.recManifestSource?.retryBaseMs, 200);
     });
 
+    it('defaults replay config to safe bounded values', () => {
+        const config = parseIndexerEnv(recSourceEnv());
+        assert.equal(
+            config.recManifestSource?.cursorReplay.enabled,
+            true,
+        );
+        assert.equal(
+            config.recManifestSource?.cursorReplay.intervalSeconds,
+            60,
+        );
+        assert.equal(
+            config.recManifestSource?.cursorReplay.maxPagesPerCycle,
+            2,
+        );
+        assert.equal(
+            config.recManifestSource?.cursorReplay.maxKeysPerCycle,
+            1000,
+        );
+        assert.equal(
+            config.recManifestSource?.cursorReplay.lowerBound,
+            null,
+        );
+    });
+
+    it('parses replay config overrides', () => {
+        const env = {
+            ...recSourceEnv(),
+            REZ_RESTORE_INDEXER_SOURCE_REPLAY_ENABLED: 'false',
+            REZ_RESTORE_INDEXER_SOURCE_REPLAY_INTERVAL_SECONDS: '15',
+            REZ_RESTORE_INDEXER_SOURCE_REPLAY_MAX_PAGES_PER_CYCLE: '8',
+            REZ_RESTORE_INDEXER_SOURCE_REPLAY_MAX_KEYS_PER_CYCLE: '2500',
+            REZ_RESTORE_INDEXER_SOURCE_REPLAY_LOWER_BOUND:
+                'rez/restore-artifacts/tenant-a',
+        };
+        const config = parseIndexerEnv(env);
+        assert.equal(
+            config.recManifestSource?.cursorReplay.enabled,
+            false,
+        );
+        assert.equal(
+            config.recManifestSource?.cursorReplay.intervalSeconds,
+            15,
+        );
+        assert.equal(
+            config.recManifestSource?.cursorReplay.maxPagesPerCycle,
+            8,
+        );
+        assert.equal(
+            config.recManifestSource?.cursorReplay.maxKeysPerCycle,
+            2500,
+        );
+        assert.equal(
+            config.recManifestSource?.cursorReplay.lowerBound,
+            'rez/restore-artifacts/tenant-a',
+        );
+    });
+
+    it('treats empty replay lower bound as null', () => {
+        const env = {
+            ...recSourceEnv(),
+            REZ_RESTORE_INDEXER_SOURCE_REPLAY_LOWER_BOUND: '   ',
+        };
+        const config = parseIndexerEnv(env);
+        assert.equal(
+            config.recManifestSource?.cursorReplay.lowerBound,
+            null,
+        );
+    });
+
+    it('throws on invalid replay enabled boolean', () => {
+        const env = {
+            ...recSourceEnv(),
+            REZ_RESTORE_INDEXER_SOURCE_REPLAY_ENABLED: 'maybe',
+        };
+        assert.throws(
+            () => parseIndexerEnv(env),
+            /REZ_RESTORE_INDEXER_SOURCE_REPLAY_ENABLED must be true or false/,
+        );
+    });
+
     it('parses ENDPOINT as optional string', () => {
         const env = {
             ...recSourceEnv(),

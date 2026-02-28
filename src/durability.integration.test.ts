@@ -9,6 +9,12 @@ import { RestoreIndexerService } from './indexer.service';
 import { PostgresRestoreIndexStore } from './store';
 import { buildTestInput } from './test-helpers';
 import {
+    parseSourceCursorState,
+    serializeSourceCursorState,
+    SOURCE_CURSOR_VERSION,
+} from './source-cursor';
+import {
+    type ArtifactBatchSource,
     InMemoryArtifactBatchSource,
     RestoreIndexerWorker,
 } from './worker';
@@ -327,6 +333,136 @@ async () => {
         assert.equal(
             watermarkAfterResume.watermark?.indexed_through_offset,
             thirdLargeOffset,
+        );
+    } finally {
+        await first.close();
+
+        if (restarted) {
+            await restarted.close();
+        }
+    }
+});
+
+test('restart preserves v2 replay cursor state across worker continuity',
+async () => {
+    const db = newDb();
+    const scope = {
+        instanceId: 'sn-dev-01',
+        source: 'sn://acme-dev.service-now.com',
+        tenantId: 'tenant-acme',
+    };
+    const first = createFixture(db);
+    let restarted: Fixture | null = null;
+    const firstNextCursor = serializeSourceCursorState({
+        replay: {
+            enabled: true,
+            last_replay_at: '2026-02-18T13:00:00.000Z',
+            lower_bound: 'rez/restore-artifacts',
+        },
+        scan_cursor: 'rez/restore-artifacts/kind=schema/900.manifest.json',
+        v: SOURCE_CURSOR_VERSION,
+    });
+    const resumedNextCursor = serializeSourceCursorState({
+        replay: {
+            enabled: true,
+            last_replay_at: '2026-02-18T13:05:00.000Z',
+            lower_bound: 'rez/restore-artifacts',
+        },
+        scan_cursor: 'rez/restore-artifacts/kind=schema/900.manifest.json',
+        v: SOURCE_CURSOR_VERSION,
+    });
+
+    try {
+        const firstSource: ArtifactBatchSource = {
+            async readBatch() {
+                return {
+                    items: [buildTestInput({
+                        eventId: 'evt-durable-replay-1',
+                        offset: 200,
+                    })],
+                    nextCursor: firstNextCursor,
+                    realtimeLagSeconds: 25,
+                    scanCounters: {
+                        fastPathSelectedKeyCount: 1,
+                        replayCycleRan: false,
+                        replayOnlyHitCount: 0,
+                        replayPathSelectedKeyCount: 0,
+                    },
+                };
+            },
+        };
+        const worker = new RestoreIndexerWorker(
+            firstSource,
+            first.indexer,
+            10,
+            {
+                sourceProgressScope: scope,
+                timeProvider: () => '2026-02-18T13:00:30.000Z',
+            },
+        );
+        const firstRun = await worker.runOnce();
+
+        assert.equal(firstRun.inserted, 1);
+        assert.equal(firstRun.cursor, firstNextCursor);
+
+        restarted = createFixture(db);
+
+        let resumedCursor: string | null = null;
+        const resumedSource: ArtifactBatchSource = {
+            async readBatch(input) {
+                resumedCursor = input.cursor;
+
+                return {
+                    items: [buildTestInput({
+                        eventId: 'evt-durable-replay-2',
+                        offset: 201,
+                    })],
+                    nextCursor: resumedNextCursor,
+                    realtimeLagSeconds: 10,
+                    scanCounters: {
+                        fastPathSelectedKeyCount: 0,
+                        replayCycleRan: true,
+                        replayOnlyHitCount: 1,
+                        replayPathSelectedKeyCount: 1,
+                    },
+                };
+            },
+        };
+        const resumedWorker = new RestoreIndexerWorker(
+            resumedSource,
+            restarted.indexer,
+            10,
+            {
+                sourceProgressScope: scope,
+                timeProvider: () => '2026-02-18T13:05:30.000Z',
+            },
+        );
+        const resumedRun = await resumedWorker.runOnce();
+
+        assert.equal(resumedRun.inserted, 1);
+        assert.equal(resumedCursor, firstNextCursor);
+
+        const progress = await restarted.indexer.getSourceProgress(
+            scope.tenantId,
+            scope.instanceId,
+            scope.source,
+        );
+
+        assert.equal(progress?.cursor, resumedNextCursor);
+        assert.equal(progress?.processed_count, 2);
+
+        const cursorState = parseSourceCursorState(progress?.cursor || null, {
+            enabled: true,
+            lowerBound: 'rez/restore-artifacts',
+        });
+
+        assert.equal(
+            cursorState.scan_cursor,
+            'rez/restore-artifacts/kind=schema/900.manifest.json',
+        );
+        assert.equal(
+            cursorState.replay.last_replay_at,
+            '2026-02-18T13:05:00.000Z',
         );
     } finally {
         await first.close();

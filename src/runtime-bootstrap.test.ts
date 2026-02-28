@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it, test } from 'node:test';
+import { parseSourceCursorState } from './source-cursor';
 import { createRuntime } from './runtime';
 import { InMemoryRestoreIndexStore } from './store';
 import type { RecManifestObjectStoreClient } from './rec-manifest-source';
@@ -56,6 +57,7 @@ class SingleBatchObjectStoreClient implements RecManifestObjectStoreClient {
                 partition: 0,
                 source: 'sn://acme-dev.service-now.com',
                 table: 'x_app.ticket',
+                tenant_id: 'tenant-acme',
                 topic: 'rez.cdc',
             });
         }
@@ -68,6 +70,7 @@ class SingleBatchObjectStoreClient implements RecManifestObjectStoreClient {
                 __table: 'x_app.ticket',
                 __time: '2026-02-18T15:16:17Z',
                 __type: 'cdc.write',
+                tenant_id: 'tenant-acme',
             });
         }
 
@@ -194,9 +197,87 @@ async () => {
         'sn://acme-dev.service-now.com',
     );
 
-    assert.equal(progress?.cursor, manifestKey);
+    const state = parseSourceCursorState(progress?.cursor || null, {
+        enabled: true,
+        lowerBound: null,
+    });
+
+    assert.equal(state.scan_cursor, manifestKey);
     assert.equal(progress?.lastBatchSize, 1);
     assert.equal(progress?.lastIndexedOffset, '1');
+});
+
+test('runtime worker fails closed on malformed persisted source cursor',
+async () => {
+    const prefix = 'rez/restore-artifacts';
+    const manifestKey = `${prefix}/manifest-001.manifest.json`;
+    const artifactKey = `${prefix}/manifest-001.artifact.json`;
+    const client = new SingleBatchObjectStoreClient(manifestKey, artifactKey);
+    const store = new InMemoryRestoreIndexStore();
+    const runtime = createRuntime(buildRecModeEnv({
+        REZ_RESTORE_INDEXER_SOURCE_PREFIX: prefix,
+        REZ_RESTORE_INDEXER_SOURCE_TENANT_ID: 'tenant-acme',
+    }), {
+        createObjectStoreClient: () => client,
+        createStore: () => store,
+    });
+    const malformedCursor = '{"v":2,"scan_cursor":"scan-key","replay":';
+
+    await store.putSourceProgress({
+        cursor: malformedCursor,
+        instanceId: 'sn-dev-01',
+        lastBatchSize: 0,
+        lastIndexedEventTime: null,
+        lastIndexedOffset: null,
+        lastLagSeconds: null,
+        processedCount: 0,
+        source: 'sn://acme-dev.service-now.com',
+        tenantId: 'tenant-acme',
+        updatedAt: '2026-02-28T20:00:00.000Z',
+    });
+
+    const originalConsoleError = console.error;
+    const errors: unknown[][] = [];
+
+    console.error = (...args: unknown[]) => {
+        errors.push(args);
+    };
+
+    try {
+        await assert.rejects(async () => {
+            await runtime.worker.runOnce();
+        }, /source cursor parse failure \(fail-closed\)/);
+    } finally {
+        console.error = originalConsoleError;
+    }
+
+    assert.equal(store.getIndexedEventCount(), 0);
+    assert.equal(client.listCalls.length, 0);
+    assert.equal(client.readCalls.length, 0);
+
+    const progress = await store.getSourceProgress(
+        'tenant-acme',
+        'sn-dev-01',
+        'sn://acme-dev.service-now.com',
+    );
+
+    assert.equal(progress?.cursor, malformedCursor);
+
+    const cursorFailureLog = errors.find((entry) => {
+        return String(entry[0]).includes(
+            'restore-indexer source cursor parse failed',
+        );
+    });
+    const cursorFailurePayload = cursorFailureLog?.[1] as
+        | Record<string, unknown>
+        | undefined;
+
+    assert.notEqual(cursorFailureLog, undefined);
+    assert.equal(cursorFailurePayload?.cursor_kind, 'json_like');
+    assert.match(
+        String(cursorFailurePayload?.error_message),
+        /manual_remediation=update rez_restore_index\.source_progress\.cursor/,
+    );
 });
 
 describe('createRuntime - additional', () => {
@@ -293,7 +374,12 @@ describe('createRuntime - additional', () => {
             'sn://acme-dev.service-now.com',
         );
         assert.notEqual(progress, null);
-        assert.equal(progress?.cursor, mKey);
+        const state = parseSourceCursorState(progress?.cursor || null, {
+            enabled: true,
+            lowerBound: null,
+        });
+
+        assert.equal(state.scan_cursor, mKey);
     });
 
     it('source progress scope not set for scaffold mode',

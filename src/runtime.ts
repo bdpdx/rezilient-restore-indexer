@@ -67,6 +67,7 @@ function createRecSource(
         });
     const objectStoreClient = objectStoreClientFactory(sourceConfig);
     const source = new RecManifestArtifactBatchSource(objectStoreClient, {
+        cursorReplay: sourceConfig.cursorReplay,
         generationId: sourceConfig.generationId,
         ingestionMode: sourceConfig.ingestionMode,
         maxAttempts: sourceConfig.maxAttempts,

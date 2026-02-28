@@ -7,6 +7,10 @@ import {
 import { RestoreIndexerService } from './indexer.service';
 import { InMemoryRestoreIndexStore } from './store';
 import { buildTestInput } from './test-helpers';
+import {
+    type ArtifactBatchSource,
+    RestoreIndexerWorker,
+} from './worker';
 
 test('freshness gate transitions stale blocked to preview_only on timeout',
 async () => {
@@ -162,4 +166,68 @@ test('backfill controller pauses fail-closed on indexing failures', async () => 
     assert.equal(state.cursor, null);
     assert.equal(state.processedCount, 1);
     assert.equal(store.getIndexedEventCount(), 1);
+});
+
+test('worker preserves persisted source progress when cursor parse fails',
+async () => {
+    const store = new InMemoryRestoreIndexStore();
+    const indexer = new RestoreIndexerService(store, {
+        freshnessPolicy: {
+            staleAfterSeconds: 120,
+            timeoutSeconds: 60,
+        },
+    });
+    const sourceScope = {
+        instanceId: 'sn-dev-01',
+        source: 'sn://acme-dev.service-now.com',
+        tenantId: 'tenant-acme',
+    };
+    const malformedCursor = '{"v":2,"scan_cursor":"scan-key","replay":';
+
+    await store.putSourceProgress({
+        cursor: malformedCursor,
+        instanceId: sourceScope.instanceId,
+        lastBatchSize: 1,
+        lastIndexedEventTime: '2026-02-16T12:00:00.000Z',
+        lastIndexedOffset: '1',
+        lastLagSeconds: 5,
+        processedCount: 42,
+        source: sourceScope.source,
+        tenantId: sourceScope.tenantId,
+        updatedAt: '2026-02-16T12:00:00.000Z',
+    });
+
+    const source: ArtifactBatchSource = {
+        async readBatch(input) {
+            assert.equal(input.cursor, malformedCursor);
+            throw new Error(
+                'source cursor parse failure (fail-closed): '
+                + 'invalid source cursor state',
+            );
+        },
+    };
+    const worker = new RestoreIndexerWorker(source, indexer, 10, {
+        sourceProgressScope: sourceScope,
+    });
+    const originalConsoleError = console.error;
+
+    console.error = () => {};
+
+    try {
+        await assert.rejects(async () => {
+            await worker.runOnce();
+        }, /source cursor parse failure \(fail-closed\)/);
+    } finally {
+        console.error = originalConsoleError;
+    }
+
+    const progress = await store.getSourceProgress(
+        sourceScope.tenantId,
+        sourceScope.instanceId,
+        sourceScope.source,
+    );
+
+    assert.equal(progress?.cursor, malformedCursor);
+    assert.equal(progress?.processedCount, 42);
+    assert.equal(store.getIndexedEventCount(), 0);
 });

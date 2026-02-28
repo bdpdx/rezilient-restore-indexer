@@ -12,7 +12,7 @@
         "build": "tsc -p tsconfig.json",
         "start": "node dist/index.js",
         "start:dev": "ts-node src/index.ts",
-        "test": "npm run build && node --test dist/env.test.js dist/metadata.test.js dist/freshness.unit.test.js dist/store.unit.test.js dist/store.pg.test.js dist/indexer.unit.test.js dist/backfill.unit.test.js dist/worker.unit.test.js dist/rec-manifest-source.unit.test.js dist/rec-manifest-object-store-client.test.js dist/watermark-invariants.test.js dist/generation-replay.integration.test.js dist/failure-modes.test.js dist/worker.integration.test.js dist/runtime-bootstrap.test.js dist/durability.integration.test.js dist/continuous-runtime.integration.test.js dist/rec-manifest-source.test.js"
+        "test": "npm run build && node --test dist/env.test.js dist/source-cursor.test.js dist/metadata.test.js dist/freshness.unit.test.js dist/store.unit.test.js dist/store.pg.test.js dist/indexer.unit.test.js dist/backfill.unit.test.js dist/worker.unit.test.js dist/rec-manifest-source.unit.test.js dist/rec-manifest-object-store-client.test.js dist/watermark-invariants.test.js dist/generation-replay.integration.test.js dist/failure-modes.test.js dist/worker.integration.test.js dist/runtime-bootstrap.test.js dist/durability.integration.test.js dist/continuous-runtime.integration.test.js dist/rec-manifest-source.test.js"
     },
     "dependencies": {
         "@aws-sdk/client-s3": "^3.991.0",
