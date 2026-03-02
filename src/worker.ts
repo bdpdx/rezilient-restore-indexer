@@ -7,9 +7,11 @@ import {
     type SourceCursorReplayDefaults,
     type SourceCursorV3State,
 } from './source-cursor';
+import type { RestoreIndexStore } from './store';
 import type {
     IndexArtifactInput,
     ProcessBatchResult,
+    SourceProgressState,
 } from './types';
 
 export type ArtifactBatch = {
@@ -36,17 +38,11 @@ export interface ArtifactBatchSource {
 export interface SourceLeaderLeaseManager {
     acquireSourceLeaderLease(input: {
         holderId: string;
-        instanceId: string;
         leaseDurationSeconds: number;
-        source: string;
-        tenantId: string;
-    }): Promise<boolean>;
+    } & (SourceProgressScope | SourceIngestScope)): Promise<boolean>;
     releaseSourceLeaderLease(input: {
         holderId: string;
-        instanceId: string;
-        source: string;
-        tenantId: string;
-    }): Promise<void>;
+    } & (SourceProgressScope | SourceIngestScope)): Promise<void>;
 }
 
 export type SourceProgressScope = {
@@ -54,6 +50,26 @@ export type SourceProgressScope = {
     source: string;
     tenantId: string;
 };
+
+export type SourceIngestScope = {
+    ingestScopeId: string;
+    sourceUri: string;
+};
+
+export type SourceProgressStore = Pick<
+    RestoreIndexStore,
+    'getSourceProgress' | 'putSourceProgress'
+>;
+
+type SourceRuntimeScope =
+    | {
+        mode: 'legacy';
+        scope: SourceProgressScope;
+    }
+    | {
+        mode: 'ingest';
+        scope: SourceIngestScope;
+    };
 
 export type SourceLeaderLeaseOptions = {
     holderId: string;
@@ -84,7 +100,9 @@ export type RestoreIndexerWorkerOptions = {
     pollIntervalMs?: number;
     sleep?: (ms: number) => Promise<void>;
     sourceCursorMode?: SourceCursorMode;
+    sourceIngestScope?: SourceIngestScope;
     sourceProgressScope?: SourceProgressScope;
+    sourceProgressStore?: SourceProgressStore;
     timeProvider?: () => string;
 };
 
@@ -117,13 +135,27 @@ function maxIso(
 
 function maxNullableIso(
     left: string | null,
-    right: string,
-): string {
+    right: string | null,
+): string | null {
+    if (right === null) {
+        return left;
+    }
+
     if (left === null) {
         return right;
     }
 
     return maxIso(left, right);
+}
+
+function buildLegacyIngestScopeId(
+    scope: SourceProgressScope,
+): string {
+    return `legacy:${JSON.stringify([
+        scope.tenantId,
+        scope.instanceId,
+        scope.source,
+    ])}`;
 }
 
 function normalizeOffset(value: unknown): string | null {
@@ -150,6 +182,21 @@ function compareOffsets(
     }
 
     return leftValue > rightValue ? 1 : -1;
+}
+
+function maxNullableOffset(
+    left: string | null,
+    right: string | null,
+): string | null {
+    if (left === null) {
+        return right;
+    }
+
+    if (right === null) {
+        return left;
+    }
+
+    return compareOffsets(left, right) >= 0 ? left : right;
 }
 
 function incrementOffset(
@@ -507,7 +554,9 @@ export class RestoreIndexerWorker {
 
     private readonly sourceCursorMode: SourceCursorMode;
 
-    private readonly sourceProgressScope?: SourceProgressScope;
+    private readonly sourceProgressStore?: SourceProgressStore;
+
+    private readonly sourceRuntimeScope?: SourceRuntimeScope;
 
     private readonly timeProvider: () => string;
 
@@ -526,12 +575,35 @@ export class RestoreIndexerWorker {
         this.sleep = options.sleep ?? sleepMs;
         this.leaderLease = options.leaderLease;
         this.sourceCursorMode = options.sourceCursorMode ?? 'mixed';
-        this.sourceProgressScope = options.sourceProgressScope;
+        this.sourceProgressStore = options.sourceProgressStore;
         this.timeProvider = options.timeProvider ?? nowIso;
 
-        if (this.leaderLease && !this.sourceProgressScope) {
+        if (options.sourceIngestScope) {
+            this.sourceRuntimeScope = {
+                mode: 'ingest',
+                scope: options.sourceIngestScope,
+            };
+        } else if (options.sourceProgressScope) {
+            this.sourceRuntimeScope = {
+                mode: 'legacy',
+                scope: options.sourceProgressScope,
+            };
+        } else {
+            this.sourceRuntimeScope = undefined;
+        }
+
+        if (this.leaderLease && !this.sourceRuntimeScope) {
             throw new Error(
                 'leader lease requires sourceProgressScope to be configured',
+            );
+        }
+
+        if (
+            this.sourceRuntimeScope?.mode === 'ingest'
+            && !this.sourceProgressStore
+        ) {
+            throw new Error(
+                'sourceProgressStore is required for sourceIngestScope',
             );
         }
     }
@@ -666,29 +738,44 @@ export class RestoreIndexerWorker {
     }
 
     private async ensureLeadership(): Promise<boolean> {
-        if (!this.leaderLease || !this.sourceProgressScope) {
+        if (!this.leaderLease || !this.sourceRuntimeScope) {
             return true;
         }
 
-        const acquired = await this.leaderLease.manager.acquireSourceLeaderLease({
-            holderId: this.leaderLease.holderId,
-            instanceId: this.sourceProgressScope.instanceId,
-            leaseDurationSeconds: this.leaderLease.leaseDurationSeconds,
-            source: this.sourceProgressScope.source,
-            tenantId: this.sourceProgressScope.tenantId,
-        });
+        const acquired = this.sourceRuntimeScope.mode === 'ingest'
+            ? await this.leaderLease.manager.acquireSourceLeaderLease({
+                holderId: this.leaderLease.holderId,
+                ingestScopeId: this.sourceRuntimeScope.scope.ingestScopeId,
+                leaseDurationSeconds: this.leaderLease.leaseDurationSeconds,
+                sourceUri: this.sourceRuntimeScope.scope.sourceUri,
+            })
+            : await this.leaderLease.manager.acquireSourceLeaderLease({
+                holderId: this.leaderLease.holderId,
+                instanceId: this.sourceRuntimeScope.scope.instanceId,
+                leaseDurationSeconds: this.leaderLease.leaseDurationSeconds,
+                source: this.sourceRuntimeScope.scope.source,
+                tenantId: this.sourceRuntimeScope.scope.tenantId,
+            });
 
         if (acquired !== this.isLeader) {
             const message = acquired
                 ? 'restore-indexer leader lease acquired'
                 : 'restore-indexer leader lease unavailable';
 
-            console.log(message, {
-                holder_id: this.leaderLease.holderId,
-                instance_id: this.sourceProgressScope.instanceId,
-                source: this.sourceProgressScope.source,
-                tenant_id: this.sourceProgressScope.tenantId,
-            });
+            if (this.sourceRuntimeScope.mode === 'ingest') {
+                console.log(message, {
+                    holder_id: this.leaderLease.holderId,
+                    ingest_scope_id: this.sourceRuntimeScope.scope.ingestScopeId,
+                    source_uri: this.sourceRuntimeScope.scope.sourceUri,
+                });
+            } else {
+                console.log(message, {
+                    holder_id: this.leaderLease.holderId,
+                    instance_id: this.sourceRuntimeScope.scope.instanceId,
+                    source: this.sourceRuntimeScope.scope.source,
+                    tenant_id: this.sourceRuntimeScope.scope.tenantId,
+                });
+            }
         }
 
         this.isLeader = acquired;
@@ -699,7 +786,7 @@ export class RestoreIndexerWorker {
     private async releaseLeadership(): Promise<void> {
         if (
             !this.leaderLease
-            || !this.sourceProgressScope
+            || !this.sourceRuntimeScope
             || !this.isLeader
         ) {
             return;
@@ -708,12 +795,20 @@ export class RestoreIndexerWorker {
         this.isLeader = false;
 
         try {
-            await this.leaderLease.manager.releaseSourceLeaderLease({
-                holderId: this.leaderLease.holderId,
-                instanceId: this.sourceProgressScope.instanceId,
-                source: this.sourceProgressScope.source,
-                tenantId: this.sourceProgressScope.tenantId,
-            });
+            if (this.sourceRuntimeScope.mode === 'ingest') {
+                await this.leaderLease.manager.releaseSourceLeaderLease({
+                    holderId: this.leaderLease.holderId,
+                    ingestScopeId: this.sourceRuntimeScope.scope.ingestScopeId,
+                    sourceUri: this.sourceRuntimeScope.scope.sourceUri,
+                });
+            } else {
+                await this.leaderLease.manager.releaseSourceLeaderLease({
+                    holderId: this.leaderLease.holderId,
+                    instanceId: this.sourceRuntimeScope.scope.instanceId,
+                    source: this.sourceRuntimeScope.scope.source,
+                    tenantId: this.sourceRuntimeScope.scope.tenantId,
+                });
+            }
         } catch (error: unknown) {
             console.error(
                 'restore-indexer leader lease release failed',
@@ -729,15 +824,20 @@ export class RestoreIndexerWorker {
 
         this.cursorLoaded = true;
 
-        if (!this.sourceProgressScope) {
+        if (!this.sourceRuntimeScope) {
             return;
         }
 
-        const progress = await this.indexer.getSourceProgress(
-            this.sourceProgressScope.tenantId,
-            this.sourceProgressScope.instanceId,
-            this.sourceProgressScope.source,
-        );
+        const progress = this.sourceRuntimeScope.mode === 'ingest'
+            ? await this.sourceProgressStore?.getSourceProgress({
+                ingestScopeId: this.sourceRuntimeScope.scope.ingestScopeId,
+                sourceUri: this.sourceRuntimeScope.scope.sourceUri,
+            }) || null
+            : await this.indexer.getSourceProgress(
+                this.sourceRuntimeScope.scope.tenantId,
+                this.sourceRuntimeScope.scope.instanceId,
+                this.sourceRuntimeScope.scope.source,
+            );
 
         if (progress) {
             this.cursor = progress.cursor;
@@ -753,7 +853,12 @@ export class RestoreIndexerWorker {
             nextCursor: string | null;
         },
     ): Promise<void> {
-        if (!this.sourceProgressScope) {
+        if (!this.sourceRuntimeScope) {
+            return;
+        }
+
+        if (this.sourceRuntimeScope.mode === 'ingest') {
+            await this.persistIngestScopeProgress(batch, result, cursor);
             return;
         }
 
@@ -761,7 +866,7 @@ export class RestoreIndexerWorker {
 
         await this.indexer.recordSourceProgress({
             cursor: cursor.nextCursor,
-            instanceId: this.sourceProgressScope.instanceId,
+            instanceId: this.sourceRuntimeScope.scope.instanceId,
             lastBatchSize: batch.items.length,
             lastIndexedEventTime: latestEventTime(progressItems),
             lastIndexedOffset: latestOffset(progressItems),
@@ -770,8 +875,60 @@ export class RestoreIndexerWorker {
                 : null,
             measuredAt: cursor.measuredAt,
             processedDelta: result.inserted + result.existing,
-            source: this.sourceProgressScope.source,
-            tenantId: this.sourceProgressScope.tenantId,
+            source: this.sourceRuntimeScope.scope.source,
+            tenantId: this.sourceRuntimeScope.scope.tenantId,
+        });
+    }
+
+    private async persistIngestScopeProgress(
+        batch: ArtifactBatch,
+        result: ProcessBatchResult,
+        cursor: {
+            advanceCursor: boolean;
+            measuredAt: string;
+            nextCursor: string | null;
+        },
+    ): Promise<void> {
+        if (
+            !this.sourceProgressStore
+            || !this.sourceRuntimeScope
+            || this.sourceRuntimeScope.mode !== 'ingest'
+        ) {
+            return;
+        }
+
+        const scope = this.sourceRuntimeScope.scope;
+        const progressItems = cursor.advanceCursor ? batch.items : [];
+        const current = await this.sourceProgressStore.getSourceProgress({
+            ingestScopeId: scope.ingestScopeId,
+            sourceUri: scope.sourceUri,
+        });
+        const nextState: SourceProgressState = {
+            cursor: cursor.nextCursor,
+            instanceId: current?.instanceId || scope.ingestScopeId,
+            lastBatchSize: batch.items.length,
+            lastIndexedEventTime: maxNullableIso(
+                current?.lastIndexedEventTime ?? null,
+                latestEventTime(progressItems),
+            ),
+            lastIndexedOffset: maxNullableOffset(
+                current?.lastIndexedOffset ?? null,
+                latestOffset(progressItems),
+            ),
+            lastLagSeconds: cursor.advanceCursor
+                ? batch.realtimeLagSeconds
+                : null,
+            processedCount: (current?.processedCount ?? 0)
+                + Math.max(0, result.inserted + result.existing),
+            source: current?.source || scope.sourceUri,
+            tenantId: current?.tenantId || 'runtime-scope',
+            updatedAt: cursor.measuredAt,
+        };
+
+        await this.sourceProgressStore.putSourceProgress({
+            ingestScopeId: scope.ingestScopeId,
+            sourceUri: scope.sourceUri,
+            state: nextState,
         });
     }
 
@@ -934,9 +1091,21 @@ export class RestoreIndexerWorker {
                 cursor_kind: classifyCursorKind(cursor),
                 cursor_preview: summarizeCursor(cursor),
                 error_message: errorMessage,
-                instance_id: this.sourceProgressScope?.instanceId || null,
-                source: this.sourceProgressScope?.source || null,
-                tenant_id: this.sourceProgressScope?.tenantId || null,
+                ingest_scope_id: this.sourceRuntimeScope?.mode === 'ingest'
+                    ? this.sourceRuntimeScope.scope.ingestScopeId
+                    : null,
+                instance_id: this.sourceRuntimeScope?.mode === 'legacy'
+                    ? this.sourceRuntimeScope.scope.instanceId
+                    : null,
+                source: this.sourceRuntimeScope?.mode === 'legacy'
+                    ? this.sourceRuntimeScope.scope.source
+                    : null,
+                source_uri: this.sourceRuntimeScope?.mode === 'ingest'
+                    ? this.sourceRuntimeScope.scope.sourceUri
+                    : null,
+                tenant_id: this.sourceRuntimeScope?.mode === 'legacy'
+                    ? this.sourceRuntimeScope.scope.tenantId
+                    : null,
             },
         );
     }

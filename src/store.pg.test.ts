@@ -11,6 +11,32 @@ type Fixture = {
     store: PostgresRestoreIndexStore;
 };
 
+function buildSourceProgressState(): {
+    cursor: string | null;
+    instanceId: string;
+    lastBatchSize: number;
+    lastIndexedEventTime: string | null;
+    lastIndexedOffset: string | null;
+    lastLagSeconds: number | null;
+    processedCount: number;
+    source: string;
+    tenantId: string;
+    updatedAt: string;
+} {
+    return {
+        cursor: 'c1',
+        instanceId: 'sn-dev-01',
+        lastBatchSize: 10,
+        lastIndexedEventTime: '2026-02-16T12:00:00.000Z',
+        lastIndexedOffset: '50',
+        lastLagSeconds: 5,
+        processedCount: 10,
+        source: 'sn://acme-dev.service-now.com',
+        tenantId: 'tenant-acme',
+        updatedAt: '2026-02-16T12:05:00.000Z',
+    };
+}
+
 function createFixture(
     db: ReturnType<typeof newDb>,
 ): Fixture {
@@ -237,23 +263,35 @@ describe('PostgresRestoreIndexStore (pg-mem)', () => {
         };
 
         try {
-            await fixture.store.putSourceProgress({
-                cursor: 'c1',
-                instanceId: scope.instanceId,
-                lastBatchSize: 10,
-                lastIndexedEventTime: '2026-02-16T12:00:00.000Z',
-                lastIndexedOffset: '50',
-                lastLagSeconds: 5,
-                processedCount: 10,
-                source: scope.source,
-                tenantId: scope.tenantId,
-                updatedAt: '2026-02-16T12:05:00.000Z',
-            });
+            await fixture.store.putSourceProgress(buildSourceProgressState());
             const progress = await fixture.store.getSourceProgress(
                 scope.tenantId,
                 scope.instanceId,
                 scope.source,
             );
+            assert.notEqual(progress, null);
+            assert.equal(progress!.cursor, 'c1');
+            assert.equal(progress!.processedCount, 10);
+        } finally {
+            await fixture.close();
+        }
+    });
+
+    it('putSourceProgress supports ingest scope id keying',
+    async () => {
+        const db = newDb();
+        const fixture = createFixture(db);
+
+        try {
+            await fixture.store.putSourceProgress({
+                ingestScopeId: 'rec_manifest_scope_main',
+                sourceUri: 'sn://acme-dev.service-now.com',
+                state: buildSourceProgressState(),
+            });
+            const progress = await fixture.store.getSourceProgress({
+                ingestScopeId: 'rec_manifest_scope_main',
+                sourceUri: 'sn://acme-dev.service-now.com',
+            });
             assert.notEqual(progress, null);
             assert.equal(progress!.cursor, 'c1');
             assert.equal(progress!.processedCount, 10);
@@ -274,6 +312,29 @@ describe('PostgresRestoreIndexStore (pg-mem)', () => {
                 'sn://unknown.service-now.com',
             );
             assert.equal(progress, null);
+        } finally {
+            await fixture.close();
+        }
+    });
+
+    it('source progress enforces ingest scope source_uri consistency',
+    async () => {
+        const db = newDb();
+        const fixture = createFixture(db);
+
+        try {
+            await fixture.store.putSourceProgress({
+                ingestScopeId: 'rec_manifest_scope_main',
+                sourceUri: 'sn://acme-dev.service-now.com',
+                state: buildSourceProgressState(),
+            });
+            await assert.rejects(
+                async () => fixture.store.getSourceProgress({
+                    ingestScopeId: 'rec_manifest_scope_main',
+                    sourceUri: 'sn://other.service-now.com',
+                }),
+                /ingest_scope_id\/source_uri conflict/,
+            );
         } finally {
             await fixture.close();
         }
@@ -351,6 +412,24 @@ describe('PostgresRestoreIndexStore (pg-mem)', () => {
         }
     });
 
+    it('acquireSourceLeaderLease supports ingest scope id keying',
+    async () => {
+        const db = newDb();
+        const fixture = createFixture(db);
+
+        try {
+            const granted = await fixture.store.acquireSourceLeaderLease({
+                holderId: 'holder-a',
+                ingestScopeId: 'rec_manifest_scope_main',
+                leaseDurationSeconds: 30,
+                sourceUri: 'sn://acme-dev.service-now.com',
+            });
+            assert.equal(granted, true);
+        } finally {
+            await fixture.close();
+        }
+    });
+
     it('acquireSourceLeaderLease denies conflicting holder',
     async () => {
         const db = newDb();
@@ -405,6 +484,31 @@ describe('PostgresRestoreIndexStore (pg-mem)', () => {
                     ...scope,
                 });
             assert.equal(recovered, true);
+        } finally {
+            await fixture.close();
+        }
+    });
+
+    it('leader lease rejects source_uri conflict against progress row',
+    async () => {
+        const db = newDb();
+        const fixture = createFixture(db);
+
+        try {
+            await fixture.store.putSourceProgress({
+                ingestScopeId: 'rec_manifest_scope_main',
+                sourceUri: 'sn://acme-dev.service-now.com',
+                state: buildSourceProgressState(),
+            });
+            await assert.rejects(
+                async () => fixture.store.acquireSourceLeaderLease({
+                    holderId: 'holder-b',
+                    ingestScopeId: 'rec_manifest_scope_main',
+                    leaseDurationSeconds: 30,
+                    sourceUri: 'sn://other.service-now.com',
+                }),
+                /ingest_scope_id\/source_uri conflict/,
+            );
         } finally {
             await fixture.close();
         }

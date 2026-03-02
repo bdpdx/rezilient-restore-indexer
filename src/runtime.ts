@@ -156,7 +156,8 @@ export function createRuntime(
                     : undefined,
                 pollIntervalMs: config.pollIntervalMs,
                 sourceCursorMode: config.recManifestSource.cursorMode,
-                sourceProgressScope: config.recManifestSource.sourceProgressScope,
+                sourceIngestScope: config.recManifestSource.sourceIngestScope,
+                sourceProgressStore: store,
             },
         );
     }

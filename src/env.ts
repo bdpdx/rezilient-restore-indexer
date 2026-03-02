@@ -1,6 +1,6 @@
 import type { IngestionMode } from './types';
 import type { SourceCursorReplayDefaults } from './source-cursor';
-import type { SourceProgressScope } from './worker';
+import type { SourceIngestScope } from './worker';
 
 export type ArtifactSourceMode =
     | 'rec_manifest_object_store'
@@ -30,7 +30,7 @@ export type RecManifestObjectStoreSourceEnv = {
     region: string;
     retryBaseMs: number;
     secretAccessKey?: string;
-    sourceProgressScope: SourceProgressScope;
+    sourceIngestScope: SourceIngestScope;
     sessionToken?: string;
     tenantId: string;
 };
@@ -273,16 +273,15 @@ export function parseIndexerEnv(
                 2,
             ),
         };
-        const sourceProgressScope: SourceProgressScope = {
-            instanceId: readRequiredString(
+        const sourceIngestScope: SourceIngestScope = {
+            ingestScopeId: readRequiredString(
                 env,
-                'REZ_RESTORE_INDEXER_SOURCE_INSTANCE_ID',
+                'REZ_RESTORE_INDEXER_INGEST_SCOPE_ID',
             ),
-            source: readRequiredString(
+            sourceUri: readRequiredString(
                 env,
                 'REZ_RESTORE_INDEXER_SOURCE_URI',
             ),
-            tenantId,
         };
 
         recManifestSource = {
@@ -327,7 +326,7 @@ export function parseIndexerEnv(
                 200,
             ),
             secretAccessKey,
-            sourceProgressScope,
+            sourceIngestScope,
             sessionToken,
             tenantId,
         };

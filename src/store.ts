@@ -29,6 +29,204 @@ function sourceKey(
     return [tenantId, instanceId, source].join('|');
 }
 
+function runtimeIngestScopeKey(
+    ingestScopeId: string,
+): string {
+    return ingestScopeId;
+}
+
+type LegacySourceScopeInput = {
+    instanceId: string;
+    source: string;
+    tenantId: string;
+};
+
+type IngestSourceScopeInput = {
+    ingestScopeId: string;
+    sourceUri: string;
+};
+
+export type SourceProgressScopeInput =
+    | LegacySourceScopeInput
+    | IngestSourceScopeInput;
+
+export type SourceLeaderLeaseAcquireInput = {
+    holderId: string;
+    leaseDurationSeconds: number;
+} & SourceProgressScopeInput;
+
+export type SourceLeaderLeaseReleaseInput = {
+    holderId: string;
+} & SourceProgressScopeInput;
+
+export type SourceProgressPutInput = {
+    state: SourceProgressState;
+} & SourceProgressScopeInput;
+
+type ResolvedRuntimeScope = {
+    ingestScopeId: string;
+    sourceUri: string;
+};
+
+function readRequiredRuntimeText(
+    value: string,
+    field: string,
+): string {
+    const trimmed = String(value || '').trim();
+
+    if (!trimmed) {
+        throw new Error(`${field} is required`);
+    }
+
+    return trimmed;
+}
+
+function buildLegacyIngestScopeId(
+    scope: LegacySourceScopeInput,
+): string {
+    const tenantId = readRequiredRuntimeText(
+        scope.tenantId,
+        'source scope tenantId',
+    );
+    const instanceId = readRequiredRuntimeText(
+        scope.instanceId,
+        'source scope instanceId',
+    );
+    const source = readRequiredRuntimeText(
+        scope.source,
+        'source scope source',
+    );
+
+    return `legacy:${JSON.stringify([tenantId, instanceId, source])}`;
+}
+
+function resolveRuntimeScopeFromInput(
+    input: SourceProgressScopeInput,
+): ResolvedRuntimeScope {
+    if ('ingestScopeId' in input) {
+        return {
+            ingestScopeId: readRequiredRuntimeText(
+                input.ingestScopeId,
+                'ingest_scope_id',
+            ),
+            sourceUri: readRequiredRuntimeText(
+                input.sourceUri,
+                'source_uri',
+            ),
+        };
+    }
+
+    return {
+        ingestScopeId: buildLegacyIngestScopeId(input),
+        sourceUri: readRequiredRuntimeText(
+            input.source,
+            'source scope source',
+        ),
+    };
+}
+
+function resolveSourceProgressScope(
+    scopeOrTenantId: SourceProgressScopeInput | string,
+    instanceId?: string,
+    source?: string,
+): ResolvedRuntimeScope {
+    if (typeof scopeOrTenantId === 'string') {
+        return resolveRuntimeScopeFromInput({
+            instanceId: readRequiredRuntimeText(
+                instanceId || '',
+                'source scope instanceId',
+            ),
+            source: readRequiredRuntimeText(
+                source || '',
+                'source scope source',
+            ),
+            tenantId: readRequiredRuntimeText(
+                scopeOrTenantId,
+                'source scope tenantId',
+            ),
+        });
+    }
+
+    return resolveRuntimeScopeFromInput(scopeOrTenantId);
+}
+
+function resolveLegacyScopeHint(
+    scopeOrTenantId: SourceProgressScopeInput | string,
+    instanceId?: string,
+    source?: string,
+): LegacySourceScopeInput | null {
+    if (typeof scopeOrTenantId === 'string') {
+        return {
+            instanceId: readRequiredRuntimeText(
+                instanceId || '',
+                'source scope instanceId',
+            ),
+            source: readRequiredRuntimeText(
+                source || '',
+                'source scope source',
+            ),
+            tenantId: readRequiredRuntimeText(
+                scopeOrTenantId,
+                'source scope tenantId',
+            ),
+        };
+    }
+
+    if ('ingestScopeId' in scopeOrTenantId) {
+        return null;
+    }
+
+    return {
+        instanceId: readRequiredRuntimeText(
+            scopeOrTenantId.instanceId,
+            'source scope instanceId',
+        ),
+        source: readRequiredRuntimeText(
+            scopeOrTenantId.source,
+            'source scope source',
+        ),
+        tenantId: readRequiredRuntimeText(
+            scopeOrTenantId.tenantId,
+            'source scope tenantId',
+        ),
+    };
+}
+
+function resolveSourceProgressPutInput(
+    input: SourceProgressState | SourceProgressPutInput,
+): {
+    scope: ResolvedRuntimeScope;
+    state: SourceProgressState;
+} {
+    if ('state' in input) {
+        return {
+            scope: resolveRuntimeScopeFromInput(input),
+            state: input.state,
+        };
+    }
+
+    return {
+        scope: resolveRuntimeScopeFromInput({
+            instanceId: input.instanceId,
+            source: input.source,
+            tenantId: input.tenantId,
+        }),
+        state: input,
+    };
+}
+
+function buildRuntimeScopeSourceConflictError(
+    ingestScopeId: string,
+    sourceUri: string,
+    existingSourceUri: string,
+): Error {
+    return new Error(
+        `ingest_scope_id/source_uri conflict: ingest_scope_id=` +
+        `"${ingestScopeId}" source_uri="${sourceUri}" ` +
+        `existing_source_uri="${existingSourceUri}"`,
+    );
+}
+
 function eventKey(record: IndexedEventRecord): string {
     return [
         record.tenantId,
@@ -100,13 +298,9 @@ function recomputeCoverageFromWatermarks(
 }
 
 export interface RestoreIndexStore {
-    acquireSourceLeaderLease(input: {
-        holderId: string;
-        instanceId: string;
-        leaseDurationSeconds: number;
-        source: string;
-        tenantId: string;
-    }): Promise<boolean>;
+    acquireSourceLeaderLease(
+        input: SourceLeaderLeaseAcquireInput,
+    ): Promise<boolean>;
     getBackfillRun(runId: string): Promise<BackfillRunState | null>;
     getIndexedEventCount(): number;
     getPartitionWatermark(
@@ -118,24 +312,23 @@ export interface RestoreIndexStore {
         source: string,
     ): Promise<SourceCoverageState | null>;
     getSourceProgress(
-        tenantId: string,
-        instanceId: string,
-        source: string,
+        scopeOrTenantId: SourceProgressScopeInput | string,
+        instanceId?: string,
+        source?: string,
     ): Promise<SourceProgressState | null>;
     putPartitionWatermark(state: PartitionWatermarkState): Promise<void>;
-    putSourceProgress(state: SourceProgressState): Promise<void>;
+    putSourceProgress(
+        input: SourceProgressState | SourceProgressPutInput,
+    ): Promise<void>;
     recomputeSourceCoverage(input: {
         instanceId: string;
         measuredAt: string;
         source: string;
         tenantId: string;
     }): Promise<SourceCoverageState | null>;
-    releaseSourceLeaderLease(input: {
-        holderId: string;
-        instanceId: string;
-        source: string;
-        tenantId: string;
-    }): Promise<void>;
+    releaseSourceLeaderLease(
+        input: SourceLeaderLeaseReleaseInput,
+    ): Promise<void>;
     upsertBackfillRun(state: BackfillRunState): Promise<void>;
     upsertIndexedEvent(
         record: IndexedEventRecord,
@@ -159,22 +352,21 @@ export class InMemoryRestoreIndexStore implements RestoreIndexStore {
         leaseExpiresAtMs: number;
     }>();
 
+    private readonly runtimeScopeSourceUris = new Map<string, string>();
+
     getIndexedEventCount(): number {
         return this.indexedEvents.size;
     }
 
-    async acquireSourceLeaderLease(input: {
-        holderId: string;
-        instanceId: string;
-        leaseDurationSeconds: number;
-        source: string;
-        tenantId: string;
-    }): Promise<boolean> {
-        const key = sourceKey(
-            input.tenantId,
-            input.instanceId,
-            input.source,
+    async acquireSourceLeaderLease(
+        input: SourceLeaderLeaseAcquireInput,
+    ): Promise<boolean> {
+        const scope = resolveRuntimeScopeFromInput(input);
+        this.assertRuntimeScopeSourceUri(
+            scope.ingestScopeId,
+            scope.sourceUri,
         );
+        const key = runtimeIngestScopeKey(scope.ingestScopeId);
         const existing = this.sourceLeaderLeases.get(key);
         const nowMs = Date.now();
 
@@ -199,17 +391,16 @@ export class InMemoryRestoreIndexStore implements RestoreIndexStore {
         return true;
     }
 
-    async releaseSourceLeaderLease(input: {
-        holderId: string;
-        instanceId: string;
-        source: string;
-        tenantId: string;
-    }): Promise<void> {
-        const key = sourceKey(
-            input.tenantId,
-            input.instanceId,
-            input.source,
+    async releaseSourceLeaderLease(
+        input: SourceLeaderLeaseReleaseInput,
+    ): Promise<void> {
+        const scope = resolveRuntimeScopeFromInput(input);
+        this.assertRuntimeScopeSourceUri(
+            scope.ingestScopeId,
+            scope.sourceUri,
+            { registerIfMissing: false },
         );
+        const key = runtimeIngestScopeKey(scope.ingestScopeId);
         const existing = this.sourceLeaderLeases.get(key);
 
         if (!existing || existing.holderId !== input.holderId) {
@@ -292,20 +483,37 @@ export class InMemoryRestoreIndexStore implements RestoreIndexStore {
         return state ? cloneState(state) : null;
     }
 
-    async putSourceProgress(state: SourceProgressState): Promise<void> {
+    async putSourceProgress(
+        input: SourceProgressState | SourceProgressPutInput,
+    ): Promise<void> {
+        const resolved = resolveSourceProgressPutInput(input);
+        this.assertRuntimeScopeSourceUri(
+            resolved.scope.ingestScopeId,
+            resolved.scope.sourceUri,
+        );
         this.sourceProgress.set(
-            sourceKey(state.tenantId, state.instanceId, state.source),
-            cloneState(state),
+            runtimeIngestScopeKey(resolved.scope.ingestScopeId),
+            cloneState(resolved.state),
         );
     }
 
     async getSourceProgress(
-        tenantId: string,
-        instanceId: string,
-        source: string,
+        scopeOrTenantId: SourceProgressScopeInput | string,
+        instanceId?: string,
+        source?: string,
     ): Promise<SourceProgressState | null> {
+        const scope = resolveSourceProgressScope(
+            scopeOrTenantId,
+            instanceId,
+            source,
+        );
+        this.assertRuntimeScopeSourceUri(
+            scope.ingestScopeId,
+            scope.sourceUri,
+            { registerIfMissing: false },
+        );
         const state = this.sourceProgress.get(
-            sourceKey(tenantId, instanceId, source),
+            runtimeIngestScopeKey(scope.ingestScopeId),
         );
 
         return state ? cloneState(state) : null;
@@ -319,6 +527,29 @@ export class InMemoryRestoreIndexStore implements RestoreIndexStore {
         const state = this.backfillRuns.get(runId);
 
         return state ? cloneState(state) : null;
+    }
+
+    private assertRuntimeScopeSourceUri(
+        ingestScopeId: string,
+        sourceUri: string,
+        options: {
+            registerIfMissing?: boolean;
+        } = {},
+    ): void {
+        const registerIfMissing = options.registerIfMissing !== false;
+        const existingSourceUri = this.runtimeScopeSourceUris.get(ingestScopeId);
+
+        if (existingSourceUri && existingSourceUri !== sourceUri) {
+            throw buildRuntimeScopeSourceConflictError(
+                ingestScopeId,
+                sourceUri,
+                existingSourceUri,
+            );
+        }
+
+        if (!existingSourceUri && registerIfMissing) {
+            this.runtimeScopeSourceUris.set(ingestScopeId, sourceUri);
+        }
     }
 }
 
@@ -348,20 +579,26 @@ type SourceCoverageRow = {
 
 type SourceProgressRow = {
     cursor: string | null;
-    instance_id: string;
+    ingest_scope_id: string;
     last_batch_size: number;
     last_indexed_event_time: Date | string | null;
     last_indexed_offset: number | string | null;
     last_lag_seconds: number | null;
+    last_observed_instance_id: string | null;
+    last_observed_source: string | null;
+    last_observed_tenant_id: string | null;
     processed_count: number | string;
-    source: string;
-    tenant_id: string;
+    source_uri: string;
     updated_at: Date | string;
 };
 
 type SourceLeaderLeaseRow = {
     holder_id: string;
     lease_expires_at: Date | string;
+};
+
+type RuntimeScopeSourceUriRow = {
+    source_uri: string;
 };
 
 type BackfillRunRow = {
@@ -386,8 +623,8 @@ export type PostgresRestoreIndexStoreOptions = {
 };
 
 const DEFAULT_SCHEMA = 'rez_restore_index';
-const DEFAULT_SOURCE_PROGRESS_TABLE = 'source_progress';
-const DEFAULT_SOURCE_LEADER_LEASE_TABLE = 'source_leader_leases';
+const DEFAULT_SOURCE_PROGRESS_TABLE = 'source_progress_v2';
+const DEFAULT_SOURCE_LEADER_LEASE_TABLE = 'source_leader_leases_v2';
 const PG_BIGINT_MAX = BigInt('9223372036854775807');
 const UNKNOWN_SCOPE = {
     instanceId: 'unknown_instance',
@@ -563,6 +800,8 @@ export class PostgresRestoreIndexStore implements RestoreIndexStore {
 
     private readonly backfillRunsTableQualified: string;
 
+    private readonly runtimeScopeSourceUris = new Map<string, string>();
+
     private indexedEventCount = 0;
 
     constructor(
@@ -633,14 +872,12 @@ export class PostgresRestoreIndexStore implements RestoreIndexStore {
         await this.pool.end();
     }
 
-    async acquireSourceLeaderLease(input: {
-        holderId: string;
-        instanceId: string;
-        leaseDurationSeconds: number;
-        source: string;
-        tenantId: string;
-    }): Promise<boolean> {
+    async acquireSourceLeaderLease(
+        input: SourceLeaderLeaseAcquireInput,
+    ): Promise<boolean> {
         await this.ensureReady();
+        const scope = resolveRuntimeScopeFromInput(input);
+        await this.assertRuntimeScopeSourceUri(scope);
 
         const leaseDurationSeconds = Math.max(
             1,
@@ -648,9 +885,7 @@ export class PostgresRestoreIndexStore implements RestoreIndexStore {
         );
         const result = await this.pool.query<SourceLeaderLeaseRow>(
             `INSERT INTO ${this.sourceLeaderLeasesTableQualified} AS leases (
-                tenant_id,
-                instance_id,
-                source,
+                ingest_scope_id,
                 holder_id,
                 lease_expires_at,
                 created_at,
@@ -658,13 +893,11 @@ export class PostgresRestoreIndexStore implements RestoreIndexStore {
             ) VALUES (
                 $1,
                 $2,
-                $3,
-                $4,
-                now() + (($5::text || ' seconds')::interval),
+                now() + (($3::text || ' seconds')::interval),
                 now(),
                 now()
             )
-            ON CONFLICT (tenant_id, instance_id, source) DO UPDATE SET
+            ON CONFLICT (ingest_scope_id) DO UPDATE SET
                 holder_id = CASE
                     WHEN leases.holder_id = EXCLUDED.holder_id
                         OR leases.lease_expires_at <= now()
@@ -687,9 +920,7 @@ export class PostgresRestoreIndexStore implements RestoreIndexStore {
                 holder_id,
                 lease_expires_at`,
             [
-                input.tenantId,
-                input.instanceId,
-                input.source,
+                scope.ingestScopeId,
                 input.holderId,
                 leaseDurationSeconds,
             ],
@@ -702,25 +933,20 @@ export class PostgresRestoreIndexStore implements RestoreIndexStore {
         return result.rows[0].holder_id === input.holderId;
     }
 
-    async releaseSourceLeaderLease(input: {
-        holderId: string;
-        instanceId: string;
-        source: string;
-        tenantId: string;
-    }): Promise<void> {
+    async releaseSourceLeaderLease(
+        input: SourceLeaderLeaseReleaseInput,
+    ): Promise<void> {
         await this.ensureReady();
+        const scope = resolveRuntimeScopeFromInput(input);
+        await this.assertRuntimeScopeSourceUri(scope);
         await this.pool.query(
             `UPDATE ${this.sourceLeaderLeasesTableQualified}
             SET lease_expires_at = now(),
                 updated_at = now()
-            WHERE tenant_id = $1
-              AND instance_id = $2
-              AND source = $3
-              AND holder_id = $4`,
+            WHERE ingest_scope_id = $1
+              AND holder_id = $2`,
             [
-                input.tenantId,
-                input.instanceId,
-                input.source,
+                scope.ingestScopeId,
                 input.holderId,
             ],
         );
@@ -1225,36 +1451,47 @@ export class PostgresRestoreIndexStore implements RestoreIndexStore {
         };
     }
 
-    async putSourceProgress(state: SourceProgressState): Promise<void> {
+    async putSourceProgress(
+        input: SourceProgressState | SourceProgressPutInput,
+    ): Promise<void> {
         await this.ensureReady();
+        const resolved = resolveSourceProgressPutInput(input);
+        await this.assertRuntimeScopeSourceUri(resolved.scope);
+        const state = resolved.state;
 
         await this.pool.query(
             `INSERT INTO ${this.sourceProgressTableQualified} (
-                tenant_id,
-                instance_id,
-                source,
+                ingest_scope_id,
+                source_uri,
                 cursor,
                 last_batch_size,
                 last_indexed_event_time,
                 last_indexed_offset,
                 last_lag_seconds,
                 processed_count,
-                updated_at
+                updated_at,
+                last_observed_tenant_id,
+                last_observed_instance_id,
+                last_observed_source
             ) VALUES (
-                $1, $2, $3, $4, $5, $6::timestamptz, $7, $8, $9, $10::timestamptz
+                $1, $2, $3, $4, $5::timestamptz, $6, $7, $8, $9::timestamptz,
+                $10, $11, $12
             )
-            ON CONFLICT (tenant_id, instance_id, source) DO UPDATE SET
+            ON CONFLICT (ingest_scope_id) DO UPDATE SET
+                source_uri = EXCLUDED.source_uri,
                 cursor = EXCLUDED.cursor,
                 last_batch_size = EXCLUDED.last_batch_size,
                 last_indexed_event_time = EXCLUDED.last_indexed_event_time,
                 last_indexed_offset = EXCLUDED.last_indexed_offset,
                 last_lag_seconds = EXCLUDED.last_lag_seconds,
                 processed_count = EXCLUDED.processed_count,
-                updated_at = EXCLUDED.updated_at`,
+                updated_at = EXCLUDED.updated_at,
+                last_observed_tenant_id = EXCLUDED.last_observed_tenant_id,
+                last_observed_instance_id = EXCLUDED.last_observed_instance_id,
+                last_observed_source = EXCLUDED.last_observed_source`,
             [
-                state.tenantId,
-                state.instanceId,
-                state.source,
+                resolved.scope.ingestScopeId,
+                resolved.scope.sourceUri,
                 state.cursor,
                 Math.max(0, state.lastBatchSize),
                 state.lastIndexedEventTime === null
@@ -1277,37 +1514,51 @@ export class PostgresRestoreIndexStore implements RestoreIndexStore {
                     state.updatedAt,
                     'source progress updated_at',
                 ),
+                readOptionalString(state.tenantId),
+                readOptionalString(state.instanceId),
+                readOptionalString(state.source),
             ],
         );
     }
 
     async getSourceProgress(
-        tenantId: string,
-        instanceId: string,
-        source: string,
+        scopeOrTenantId: SourceProgressScopeInput | string,
+        instanceId?: string,
+        source?: string,
     ): Promise<SourceProgressState | null> {
         await this.ensureReady();
+        const scope = resolveSourceProgressScope(
+            scopeOrTenantId,
+            instanceId,
+            source,
+        );
+        const legacyScope = resolveLegacyScopeHint(
+            scopeOrTenantId,
+            instanceId,
+            source,
+        );
+        await this.assertRuntimeScopeSourceUri(scope, {
+            registerIfMissing: false,
+        });
         const result = await this.pool.query<SourceProgressRow>(
             `SELECT
-                tenant_id,
-                instance_id,
-                source,
+                ingest_scope_id,
+                source_uri,
                 cursor,
                 last_batch_size,
                 last_indexed_event_time,
                 last_indexed_offset::text AS last_indexed_offset,
                 last_lag_seconds,
                 processed_count,
-                updated_at
+                updated_at,
+                last_observed_tenant_id,
+                last_observed_instance_id,
+                last_observed_source
             FROM ${this.sourceProgressTableQualified}
-            WHERE tenant_id = $1
-              AND instance_id = $2
-              AND source = $3
+            WHERE ingest_scope_id = $1
             LIMIT 1`,
             [
-                tenantId,
-                instanceId,
-                source,
+                scope.ingestScopeId,
             ],
         );
 
@@ -1316,10 +1567,30 @@ export class PostgresRestoreIndexStore implements RestoreIndexStore {
         }
 
         const row = result.rows[0];
+        const observedTenantId = readOptionalString(row.last_observed_tenant_id)
+            || legacyScope?.tenantId
+            || UNKNOWN_SCOPE.tenantId;
+        const observedInstanceId =
+            readOptionalString(row.last_observed_instance_id)
+            || legacyScope?.instanceId
+            || UNKNOWN_SCOPE.instanceId;
+        const observedSource = readOptionalString(row.last_observed_source)
+            || legacyScope?.source
+            || readRequiredRuntimeText(
+                row.source_uri,
+                'source progress source_uri',
+            );
+        this.runtimeScopeSourceUris.set(
+            scope.ingestScopeId,
+            readRequiredRuntimeText(
+                row.source_uri,
+                'source progress source_uri',
+            ),
+        );
 
         return {
             cursor: row.cursor,
-            instanceId: row.instance_id,
+            instanceId: observedInstanceId,
             lastBatchSize: parseNonNegativeInteger(
                 row.last_batch_size,
                 'source progress last_batch_size',
@@ -1341,8 +1612,8 @@ export class PostgresRestoreIndexStore implements RestoreIndexStore {
                 row.processed_count,
                 'source progress processed_count',
             ),
-            source: row.source,
-            tenantId: row.tenant_id,
+            source: observedSource,
+            tenantId: observedTenantId,
             updatedAt: toIsoTimestamp(
                 row.updated_at,
                 'source progress updated_at',
@@ -1473,6 +1744,85 @@ export class PostgresRestoreIndexStore implements RestoreIndexStore {
         await this.ready;
     }
 
+    private async assertRuntimeScopeSourceUri(
+        scope: ResolvedRuntimeScope,
+        options: {
+            registerIfMissing?: boolean;
+        } = {},
+    ): Promise<void> {
+        const registerIfMissing = options.registerIfMissing !== false;
+        const knownSourceUri = this.runtimeScopeSourceUris.get(scope.ingestScopeId);
+
+        if (knownSourceUri && knownSourceUri !== scope.sourceUri) {
+            throw buildRuntimeScopeSourceConflictError(
+                scope.ingestScopeId,
+                scope.sourceUri,
+                knownSourceUri,
+            );
+        }
+
+        const result = await this.pool.query<RuntimeScopeSourceUriRow>(
+            `SELECT source_uri
+            FROM ${this.sourceProgressTableQualified}
+            WHERE ingest_scope_id = $1
+            LIMIT 1`,
+            [
+                scope.ingestScopeId,
+            ],
+        );
+        const persistedSourceUri = result.rowCount === 1
+            ? readRequiredRuntimeText(
+                result.rows[0].source_uri,
+                'source progress source_uri',
+            )
+            : null;
+
+        if (persistedSourceUri && persistedSourceUri !== scope.sourceUri) {
+            throw buildRuntimeScopeSourceConflictError(
+                scope.ingestScopeId,
+                scope.sourceUri,
+                persistedSourceUri,
+            );
+        }
+
+        if (persistedSourceUri) {
+            this.runtimeScopeSourceUris.set(
+                scope.ingestScopeId,
+                persistedSourceUri,
+            );
+            return;
+        }
+
+        if (registerIfMissing) {
+            this.runtimeScopeSourceUris.set(
+                scope.ingestScopeId,
+                scope.sourceUri,
+            );
+        }
+    }
+
+    private async tableExists(
+        tableQualified: string,
+    ): Promise<boolean> {
+        try {
+            await this.pool.query(
+                `SELECT 1 FROM ${tableQualified} LIMIT 1`,
+            );
+            return true;
+        } catch (error: unknown) {
+            const message = String((error as Error)?.message || error);
+
+            if (
+                message.includes('does not exist')
+                || message.includes('relation')
+            ) {
+                return false;
+            }
+
+            throw error;
+        }
+    }
+
     private async initialize(): Promise<void> {
         await this.pool.query(`CREATE SCHEMA IF NOT EXISTS "${this.schemaName}"`);
         await this.pool.query(this.createIndexEventsSql());
@@ -1480,8 +1830,12 @@ export class PostgresRestoreIndexStore implements RestoreIndexStore {
         await this.pool.query(this.createPartitionGenerationsSql());
         await this.pool.query(this.createSourceCoverageSql());
         await this.pool.query(this.createBackfillRunsSql());
-        await this.pool.query(this.createSourceProgressSql());
-        await this.pool.query(this.createSourceLeaderLeasesSql());
+        if (!(await this.tableExists(this.sourceProgressTableQualified))) {
+            await this.pool.query(this.createSourceProgressSql());
+        }
+        if (!(await this.tableExists(this.sourceLeaderLeasesTableQualified))) {
+            await this.pool.query(this.createSourceLeaderLeasesSql());
+        }
 
         const countResult = await this.pool.query<{
             count: string;
@@ -1685,23 +2039,23 @@ ON ${this.backfillRunsTableQualified} (
     private createSourceProgressSql(): string {
         return `
 CREATE TABLE IF NOT EXISTS ${this.sourceProgressTableQualified} (
-    tenant_id TEXT,
-    instance_id TEXT,
-    source TEXT,
+    ingest_scope_id TEXT PRIMARY KEY,
+    source_uri TEXT NOT NULL,
     cursor TEXT,
-    last_batch_size INTEGER,
+    last_batch_size INTEGER NOT NULL CHECK (last_batch_size >= 0),
     last_indexed_event_time TIMESTAMPTZ,
     last_indexed_offset TEXT,
-    last_lag_seconds INTEGER,
-    processed_count BIGINT,
-    updated_at TIMESTAMPTZ
+    last_lag_seconds INTEGER CHECK (last_lag_seconds >= 0),
+    processed_count BIGINT NOT NULL CHECK (processed_count >= 0),
+    updated_at TIMESTAMPTZ NOT NULL,
+    last_observed_tenant_id TEXT,
+    last_observed_instance_id TEXT,
+    last_observed_source TEXT
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS ux_source_progress_scope
+CREATE INDEX IF NOT EXISTS ix_source_progress_runtime_updated_at
 ON ${this.sourceProgressTableQualified} (
-    tenant_id,
-    instance_id,
-    source
+    updated_at DESC
 );
 `;
     }
@@ -1709,20 +2063,11 @@ ON ${this.sourceProgressTableQualified} (
     private createSourceLeaderLeasesSql(): string {
         return `
 CREATE TABLE IF NOT EXISTS ${this.sourceLeaderLeasesTableQualified} (
-    tenant_id TEXT,
-    instance_id TEXT,
-    source TEXT,
-    holder_id TEXT,
-    lease_expires_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ,
-    updated_at TIMESTAMPTZ
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS ux_source_leader_leases_scope
-ON ${this.sourceLeaderLeasesTableQualified} (
-    tenant_id,
-    instance_id,
-    source
+    ingest_scope_id TEXT PRIMARY KEY,
+    holder_id TEXT NOT NULL,
+    lease_expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS ix_source_leader_leases_active

@@ -88,7 +88,8 @@ function buildRecModeEnv(
             'postgres://rez_restore_indexer_rw:test@127.0.0.1:5432/rez_restore',
         REZ_RESTORE_INDEXER_SOURCE_BUCKET: 'rez-artifacts',
         REZ_RESTORE_INDEXER_SOURCE_GENERATION_ID: 'gen-runtime-01',
-        REZ_RESTORE_INDEXER_SOURCE_INSTANCE_ID: 'sn-dev-01',
+        REZ_RESTORE_INDEXER_INGEST_SCOPE_ID:
+            'rec_manifest_object_store:stage-main',
         REZ_RESTORE_INDEXER_SOURCE_PREFIX: 'rez/restore-artifacts',
         REZ_RESTORE_INDEXER_SOURCE_REGION: 'us-east-1',
         REZ_RESTORE_INDEXER_SOURCE_URI: 'sn://acme-dev.service-now.com',
@@ -205,11 +206,10 @@ async () => {
     assert.equal(run.failures, 0);
     assert.deepEqual(client.readCalls, [manifestKey, artifactKey]);
 
-    const progress = await store.getSourceProgress(
-        'tenant-acme',
-        'sn-dev-01',
-        'sn://acme-dev.service-now.com',
-    );
+    const progress = await store.getSourceProgress({
+        ingestScopeId: 'rec_manifest_object_store:stage-main',
+        sourceUri: 'sn://acme-dev.service-now.com',
+    });
 
     const state = parseSourceCursorState(progress?.cursor || null, {
         enabled: true,
@@ -238,16 +238,20 @@ async () => {
     const malformedCursor = '{"v":2,"scan_cursor":"scan-key","replay":';
 
     await store.putSourceProgress({
-        cursor: malformedCursor,
-        instanceId: 'sn-dev-01',
-        lastBatchSize: 0,
-        lastIndexedEventTime: null,
-        lastIndexedOffset: null,
-        lastLagSeconds: null,
-        processedCount: 0,
-        source: 'sn://acme-dev.service-now.com',
-        tenantId: 'tenant-acme',
-        updatedAt: '2026-02-28T20:00:00.000Z',
+        ingestScopeId: 'rec_manifest_object_store:stage-main',
+        sourceUri: 'sn://acme-dev.service-now.com',
+        state: {
+            cursor: malformedCursor,
+            instanceId: 'sn-dev-01',
+            lastBatchSize: 0,
+            lastIndexedEventTime: null,
+            lastIndexedOffset: null,
+            lastLagSeconds: null,
+            processedCount: 0,
+            source: 'sn://acme-dev.service-now.com',
+            tenantId: 'tenant-acme',
+            updatedAt: '2026-02-28T20:00:00.000Z',
+        },
     });
 
     const originalConsoleError = console.error;
@@ -269,11 +273,10 @@ async () => {
     assert.equal(client.listCalls.length, 0);
     assert.equal(client.readCalls.length, 0);
 
-    const progress = await store.getSourceProgress(
-        'tenant-acme',
-        'sn-dev-01',
-        'sn://acme-dev.service-now.com',
-    );
+    const progress = await store.getSourceProgress({
+        ingestScopeId: 'rec_manifest_object_store:stage-main',
+        sourceUri: 'sn://acme-dev.service-now.com',
+    });
 
     assert.equal(progress?.cursor, malformedCursor);
 
@@ -379,7 +382,7 @@ describe('createRuntime - additional', () => {
         assert.equal(run.inserted, 1);
     });
 
-    it('source progress scope set for rec_manifest mode',
+    it('source ingest scope set for rec_manifest mode',
     async () => {
         const prefix = 'rez/restore-artifacts';
         const mKey = `${prefix}/sp.manifest.json`;
@@ -397,13 +400,10 @@ describe('createRuntime - additional', () => {
             createStore: () => store,
         });
         await runtime.worker.runOnce();
-        // Verify source progress was persisted via
-        // sourceProgressScope
-        const progress = await store.getSourceProgress(
-            'tenant-acme',
-            'sn-dev-01',
-            'sn://acme-dev.service-now.com',
-        );
+        const progress = await store.getSourceProgress({
+            ingestScopeId: 'rec_manifest_object_store:stage-main',
+            sourceUri: 'sn://acme-dev.service-now.com',
+        });
         assert.notEqual(progress, null);
         const state = parseSourceCursorState(progress?.cursor || null, {
             enabled: true,

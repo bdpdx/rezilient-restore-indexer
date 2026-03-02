@@ -350,6 +350,41 @@ describe('InMemoryRestoreIndexStore', () => {
         assert.equal(result!.cursor, 'cursor-1');
     });
 
+    it('putSourceProgress stores progress by ingest scope id',
+    async () => {
+        const store = new InMemoryRestoreIndexStore();
+        await store.putSourceProgress({
+            ingestScopeId: 'rec_manifest_scope_main',
+            sourceUri: 'sn://acme-dev.service-now.com',
+            state: buildProgress({
+                cursor: 'cursor-ingest-1',
+            }),
+        });
+        const result = await store.getSourceProgress({
+            ingestScopeId: 'rec_manifest_scope_main',
+            sourceUri: 'sn://acme-dev.service-now.com',
+        });
+        assert.notEqual(result, null);
+        assert.equal(result!.cursor, 'cursor-ingest-1');
+    });
+
+    it('source progress rejects source_uri conflicts per ingest scope id',
+    async () => {
+        const store = new InMemoryRestoreIndexStore();
+        await store.putSourceProgress({
+            ingestScopeId: 'rec_manifest_scope_main',
+            sourceUri: 'sn://acme-dev.service-now.com',
+            state: buildProgress(),
+        });
+        await assert.rejects(
+            async () => store.getSourceProgress({
+                ingestScopeId: 'rec_manifest_scope_main',
+                sourceUri: 'sn://other.service-now.com',
+            }),
+            /ingest_scope_id\/source_uri conflict/,
+        );
+    });
+
     it('getSourceProgress returns null for unknown source',
     async () => {
         const store = new InMemoryRestoreIndexStore();
@@ -409,6 +444,38 @@ describe('InMemoryRestoreIndexStore', () => {
             tenantId: 'tenant-acme',
         });
         assert.equal(granted, true);
+    });
+
+    it('acquireSourceLeaderLease supports ingest scope id keying',
+    async () => {
+        const store = new InMemoryRestoreIndexStore();
+        const granted = await store.acquireSourceLeaderLease({
+            holderId: 'holder-a',
+            ingestScopeId: 'rec_manifest_scope_main',
+            leaseDurationSeconds: 30,
+            sourceUri: 'sn://acme-dev.service-now.com',
+        });
+        assert.equal(granted, true);
+    });
+
+    it('acquireSourceLeaderLease rejects source_uri conflicts',
+    async () => {
+        const store = new InMemoryRestoreIndexStore();
+        await store.acquireSourceLeaderLease({
+            holderId: 'holder-a',
+            ingestScopeId: 'rec_manifest_scope_main',
+            leaseDurationSeconds: 30,
+            sourceUri: 'sn://acme-dev.service-now.com',
+        });
+        await assert.rejects(
+            async () => store.acquireSourceLeaderLease({
+                holderId: 'holder-a',
+                ingestScopeId: 'rec_manifest_scope_main',
+                leaseDurationSeconds: 30,
+                sourceUri: 'sn://other.service-now.com',
+            }),
+            /ingest_scope_id\/source_uri conflict/,
+        );
     });
 
     it('acquireSourceLeaderLease denies different holder when active',

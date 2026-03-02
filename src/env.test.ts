@@ -25,10 +25,11 @@ function recSourceEnv(): Record<string, string> {
         REZ_RESTORE_INDEXER_ARTIFACT_SOURCE:
             'rec_manifest_object_store',
         REZ_RESTORE_INDEXER_SOURCE_BUCKET: 'test-bucket',
+        REZ_RESTORE_INDEXER_INGEST_SCOPE_ID:
+            'rec_manifest_object_store:stage-main',
         REZ_RESTORE_INDEXER_SOURCE_REGION: 'us-east-1',
         REZ_RESTORE_INDEXER_SOURCE_PREFIX: 'rez/restore/',
         REZ_RESTORE_INDEXER_SOURCE_GENERATION_ID: 'gen-01',
-        REZ_RESTORE_INDEXER_SOURCE_INSTANCE_ID: 'sn-dev-01',
         REZ_RESTORE_INDEXER_SOURCE_URI:
             'sn://acme-dev.service-now.com',
         REZ_RESTORE_INDEXER_SOURCE_TENANT_ID: 'test-tenant',
@@ -406,11 +407,11 @@ describe('parseIndexerEnv - REC manifest source config', () => {
             'test-tenant',
         );
         assert.equal(
-            config.recManifestSource.sourceProgressScope.instanceId,
-            'sn-dev-01',
+            config.recManifestSource.sourceIngestScope.ingestScopeId,
+            'rec_manifest_object_store:stage-main',
         );
         assert.equal(
-            config.recManifestSource.sourceProgressScope.source,
+            config.recManifestSource.sourceIngestScope.sourceUri,
             'sn://acme-dev.service-now.com',
         );
     });
@@ -487,12 +488,12 @@ describe('parseIndexerEnv - REC manifest source config', () => {
         );
     });
 
-    it('throws when INSTANCE_ID is missing', () => {
+    it('throws when INGEST_SCOPE_ID is missing', () => {
         const env = recSourceEnv();
-        delete env.REZ_RESTORE_INDEXER_SOURCE_INSTANCE_ID;
+        delete env.REZ_RESTORE_INDEXER_INGEST_SCOPE_ID;
         assert.throws(
             () => parseIndexerEnv(env),
-            /REZ_RESTORE_INDEXER_SOURCE_INSTANCE_ID is required/,
+            /REZ_RESTORE_INDEXER_INGEST_SCOPE_ID is required/,
         );
     });
 

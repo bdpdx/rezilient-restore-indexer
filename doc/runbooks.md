@@ -17,24 +17,25 @@
 
 ## 0. Cursor Health Checks and Replay Interpretation
 
-1. Query source progress for the affected source scope:
+1. Query source progress for the affected ingest scope:
 
 ```sql
 SELECT
-    tenant_id,
-    instance_id,
-    source,
+    ingest_scope_id,
+    source_uri,
     cursor,
     last_batch_size,
     last_indexed_event_time,
     last_indexed_offset,
     last_lag_seconds,
     processed_count,
+    last_observed_tenant_id,
+    last_observed_instance_id,
+    last_observed_source,
     updated_at
-FROM rez_restore_index.source_progress
-WHERE tenant_id = '<tenant_id>'
-  AND instance_id = '<instance_id>'
-  AND source = '<source_uri>';
+FROM rez_restore_index.source_progress_v2
+WHERE ingest_scope_id = '<ingest_scope_id>'
+  AND source_uri = '<source_uri>';
 ```
 
 2. Cursor health expectations:
@@ -67,11 +68,11 @@ WHERE tenant_id = '<tenant_id>'
    - no new batch is indexed,
    - source progress cursor is not advanced.
 3. Manual intervention is warranted when either condition is true:
-   - repeated parse-failure logs for the same source scope, or
-   - `source_progress.updated_at` and `processed_count` stall while new REC
+   - repeated parse-failure logs for the same ingest scope, or
+   - `source_progress_v2.updated_at` and `processed_count` stall while new REC
      manifests are known to exist.
 4. Remediation procedure:
-   - snapshot the current `source_progress` row for incident records,
+   - snapshot the current `source_progress_v2` row for incident records,
    - replace `cursor` with either a valid legacy key string or valid v2 JSON,
    - restart/recover worker and confirm batch progression resumes.
 5. Do not use broad cursor resets as first response if parse errors are not
@@ -88,7 +89,7 @@ WHERE tenant_id = '<tenant_id>'
    - REC rollout is `dual` or `v2` and remains stable across multiple cycles.
    - `restore-indexer batch processed` logs show sustained
      `version_mix_v2_count > 0`.
-   - `version_mix_v1_count` trends toward `0` for the target source scope.
+   - `version_mix_v1_count` trends toward `0` for the target ingest scope.
    - `v2_shard_advancements > 0` appears during active ingest windows and
      `v2_last_reconcile_at` keeps moving.
 3. Cutover procedure:
