@@ -456,6 +456,40 @@ type CursorHealthSummary = {
     v2ShardsTracked: number;
 };
 
+type BatchOutcomeLogPayload = {
+    advance_cursor: boolean;
+    batch_size: number;
+    cursor_after: string | null;
+    cursor_before: string | null;
+    existing: number;
+    failures: number;
+    fast_path_selected_key_count: number;
+    inserted: number;
+    realtime_lag_seconds: number | null;
+    replay_cycle_ran: boolean;
+    replay_only_hit_count: number;
+    replay_path_selected_key_count: number;
+    source_cursor_mode: SourceCursorMode;
+    v2_last_reconcile_at: string | null;
+    v2_shard_advancements: number;
+    v2_shard_health_parse_failed: boolean;
+    v2_shards_tracked: number;
+    v2_primary_mode_legacy_v1_items_present: boolean;
+    v2_ready_no_v1_seen: boolean;
+    version_mix_other_count: number;
+    version_mix_v1_count: number;
+    version_mix_v2_count: number;
+};
+
+function isIdleBatchOutcome(
+    payload: BatchOutcomeLogPayload,
+): boolean {
+    return payload.batch_size === 0
+        && payload.inserted === 0
+        && payload.existing === 0
+        && payload.failures === 0;
+}
+
 export class RestoreIndexerWorker {
     private cursor: string | null = null;
 
@@ -478,6 +512,8 @@ export class RestoreIndexerWorker {
     private readonly timeProvider: () => string;
 
     private isLeader = false;
+
+    private lastBatchOutcomeLogStateKey: string | null = null;
 
     constructor(
         private readonly source: ArtifactBatchSource,
@@ -802,8 +838,7 @@ export class RestoreIndexerWorker {
         const scanCounters = batch.scanCounters || defaultScanCounters();
         const layoutMix = summarizeLayoutMix(batch.items);
         const cursorHealth = this.summarizeCursorHealth(cursor.nextCursor);
-
-        console.log('restore-indexer batch processed', {
+        const payload: BatchOutcomeLogPayload = {
             advance_cursor: cursor.advanceCursor,
             batch_size: batch.items.length,
             cursor_after: cursor.nextCursor,
@@ -832,7 +867,19 @@ export class RestoreIndexerWorker {
             version_mix_other_count: layoutMix.otherCount,
             version_mix_v1_count: layoutMix.v1Count,
             version_mix_v2_count: layoutMix.v2Count,
-        });
+        };
+        const stateKey = JSON.stringify(payload);
+        const isIdle = isIdleBatchOutcome(payload);
+
+        if (
+            isIdle
+            && this.lastBatchOutcomeLogStateKey === stateKey
+        ) {
+            return;
+        }
+
+        this.lastBatchOutcomeLogStateKey = stateKey;
+        console.log('restore-indexer batch processed', payload);
 
         if (
             this.sourceCursorMode === 'v2_primary'

@@ -999,3 +999,64 @@ async () => {
     assert.equal(payload.v2_shards_tracked, 0);
     assert.equal(payload.v2_shard_health_parse_failed, false);
 });
+
+test('worker suppresses duplicate empty-poll logs until state changes',
+async () => {
+    const store = new InMemoryRestoreIndexStore();
+    const indexer = new RestoreIndexerService(store, {
+        freshnessPolicy: {
+            staleAfterSeconds: 120,
+            timeoutSeconds: 60,
+        },
+    });
+    let reads = 0;
+    const source: ArtifactBatchSource = {
+        async readBatch() {
+            reads += 1;
+
+            if (reads <= 2) {
+                return {
+                    items: [],
+                    nextCursor: null,
+                    realtimeLagSeconds: null,
+                };
+            }
+
+            return {
+                items: [],
+                nextCursor: null,
+                realtimeLagSeconds: 7,
+            };
+        },
+    };
+    const worker = new RestoreIndexerWorker(source, indexer, 10);
+    const originalLog = console.log;
+    const observedLogs: unknown[][] = [];
+
+    console.log = (...args: unknown[]) => {
+        observedLogs.push(args);
+    };
+
+    try {
+        await worker.runOnce();
+        await worker.runOnce();
+        await worker.runOnce();
+        await worker.runOnce();
+    } finally {
+        console.log = originalLog;
+    }
+
+    const batchLogs = observedLogs.filter((entry) => {
+        return entry[0] === 'restore-indexer batch processed';
+    });
+
+    assert.equal(batchLogs.length, 2);
+
+    const firstPayload = batchLogs[0]?.[1] as Record<string, unknown>;
+    const secondPayload = batchLogs[1]?.[1] as Record<string, unknown>;
+
+    assert.equal(firstPayload.batch_size, 0);
+    assert.equal(firstPayload.realtime_lag_seconds, null);
+    assert.equal(secondPayload.batch_size, 0);
+    assert.equal(secondPayload.realtime_lag_seconds, 7);
+});

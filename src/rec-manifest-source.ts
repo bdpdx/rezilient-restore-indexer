@@ -37,6 +37,7 @@ const DEFAULT_REPLAY_INTERVAL_SECONDS = 60;
 const DEFAULT_REPLAY_MAX_KEYS_PER_CYCLE = 1000;
 const DEFAULT_REPLAY_MAX_PAGES_PER_CYCLE = 2;
 const MANIFEST_SUFFIX = '.manifest.json';
+const ARTIFACT_SUFFIX = '.artifact.json';
 
 const TRANSIENT_ERROR_CODES = new Set([
     'ECONNRESET',
@@ -765,6 +766,41 @@ function summarizeCursorForLog(
     return `${compact.slice(0, maxLength)}...`;
 }
 
+function isManifestCursorLowerBound(
+    value: string,
+): boolean {
+    return value.endsWith(MANIFEST_SUFFIX) || value.endsWith(ARTIFACT_SUFFIX);
+}
+
+function deriveReplayLowerBound(
+    key: string | null,
+    fallbackPrefix: string,
+): string {
+    if (key === null) {
+        return fallbackPrefix;
+    }
+
+    const kindIndex = key.indexOf('/kind=');
+
+    if (kindIndex > 0) {
+        return key.slice(0, kindIndex);
+    }
+
+    const eventIndex = key.indexOf('/event=');
+
+    if (eventIndex > 0) {
+        return key.slice(0, eventIndex);
+    }
+
+    const offsetIndex = key.indexOf('/offset=');
+
+    if (offsetIndex > 0) {
+        return key.slice(0, offsetIndex);
+    }
+
+    return fallbackPrefix;
+}
+
 function wrapCursorParseError(
     cursor: string | null,
     error: unknown,
@@ -1079,15 +1115,35 @@ export class RecManifestArtifactBatchSource implements ArtifactBatchSource {
         cursorState: SourceCursorV3State,
         firstFastKey: string | null,
     ): string | null {
-        if (cursorState.legacy.replay.lower_bound !== null) {
-            return cursorState.legacy.replay.lower_bound;
+        const persistedLowerBound = cursorState.legacy.replay.lower_bound;
+
+        if (persistedLowerBound !== null) {
+            if (isManifestCursorLowerBound(persistedLowerBound)) {
+                return deriveReplayLowerBound(
+                    cursorState.legacy.scan_cursor || firstFastKey,
+                    this.prefix,
+                );
+            }
+
+            return persistedLowerBound;
+        }
+
+        if (this.cursorReplay.lowerBound !== null) {
+            return this.cursorReplay.lowerBound;
         }
 
         if (cursorState.legacy.scan_cursor !== null) {
-            return this.prefix;
+            return deriveReplayLowerBound(
+                cursorState.legacy.scan_cursor,
+                this.prefix,
+            );
         }
 
-        return firstFastKey;
+        if (firstFastKey !== null) {
+            return deriveReplayLowerBound(firstFastKey, this.prefix);
+        }
+
+        return this.prefix;
     }
 
     private shouldRunReplayCycle(

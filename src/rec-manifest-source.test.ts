@@ -759,16 +759,108 @@ async () => {
     assert.equal(batch.scanCounters?.replayCycleRan, true);
     assert.equal(client.listCalls.length, 2);
     assert.equal(client.listCalls[0]?.startAfter, scanCursor);
-    assert.equal(client.listCalls[1]?.startAfter, replayLowerBound);
+    assert.equal(client.listCalls[1]?.startAfter, prefix);
 
     const nextCursor = readCursorState(batch.nextCursor);
 
     assert.equal(nextCursor.scan_cursor, scanCursor);
-    assert.equal(nextCursor.replay.lower_bound, replayLowerBound);
+    assert.equal(nextCursor.replay.lower_bound, prefix);
     assert.equal(
         nextCursor.replay.last_replay_at,
         '2026-02-18T14:01:00.000Z',
     );
+});
+
+test('rec manifest source normalizes manifest-key replay lower bound to table scope',
+async () => {
+    const prefix = 'rez/restore-artifacts';
+    const tableScope =
+        `${prefix}/rec.object-key-layout.v1/instance=dev296406.service-now.com`
+        + '/app=x_rezrp_rezilient_config/table=x_rezrp_rezilient_config';
+    const persistedLowerBound =
+        `${tableScope}/kind=cdc/day=2026-03-02/event=~b64~`
+        + 'YmtwX3pJSHdFNE5jRHlrN2w0NmxoRkNFU01vMjk4STBuL2RzSjRzdFBGdHFPRlk9'
+        + '.manifest.json';
+    const scanCursor =
+        `${tableScope}/kind=schema/day=2026-03-02/event=`
+        + 'f9fa0ef2935ff210e50f77f08bba101a.manifest.json';
+    const lateManifest =
+        `${tableScope}/kind=cdc/day=2026-03-02/event=~b64~`
+        + 'YmtwX0RXQi8yRWJEdkZ0ZnpSNWZmYWRaeFNYQWFrZEN1SWlPM3NBdmxQOVlBZUU9'
+        + '.manifest.json';
+    const lateArtifact = lateManifest.replace('.manifest.json', '.artifact.json');
+    const client = new ScriptedObjectStoreClient([
+        {
+            keys: [],
+        },
+        {
+            keys: [lateManifest],
+        },
+    ], new Map([
+        [
+            lateManifest,
+            [{
+                body: JSON.stringify(buildManifest({
+                    artifactKey: lateArtifact,
+                    eventId: 'evt-late-cdc-16',
+                    eventTime: '2026-03-02T05:35:40.000Z',
+                    instanceId: 'dev296406',
+                    offset: '16',
+                    source: 'sn://dev296406.service-now.com',
+                    table: 'x_rezrp_rezilient_config',
+                    tenantId: 'bd',
+                })),
+            }],
+        ],
+        [
+            lateArtifact,
+            [{
+                body: JSON.stringify(buildCdcArtifact({
+                    eventId: 'evt-late-cdc-16',
+                    eventTime: '2026-03-02T05:35:40.000Z',
+                    source: 'sn://dev296406.service-now.com',
+                    table: 'x_rezrp_rezilient_config',
+                })),
+            }],
+        ],
+    ]));
+    const source = new RecManifestArtifactBatchSource(client, {
+        cursorReplay: {
+            enabled: true,
+            intervalSeconds: 60,
+            maxKeysPerCycle: 100,
+            maxPagesPerCycle: 2,
+        },
+        generationId: 'gen-stage',
+        prefix,
+        tenantId: 'tenant-stage',
+        timeProvider: () => '2026-03-02T05:36:00.000Z',
+    });
+    const cursor = serializeSourceCursorState({
+        replay: {
+            enabled: true,
+            last_replay_at: null,
+            lower_bound: persistedLowerBound,
+        },
+        scan_cursor: scanCursor,
+        v: SOURCE_CURSOR_VERSION,
+    });
+    const batch = await source.readBatch({
+        cursor,
+        limit: 2,
+    });
+
+    assert.equal(lateManifest < persistedLowerBound, true);
+    assert.equal(batch.items.length, 1);
+    assert.equal(batch.items[0]?.manifest.event_id, 'evt-late-cdc-16');
+    assert.equal(client.listCalls.length, 2);
+    assert.equal(client.listCalls[0]?.startAfter, scanCursor);
+    assert.equal(client.listCalls[1]?.startAfter, tableScope);
+
+    const nextCursor = readCursorState(batch.nextCursor);
+
+    assert.equal(nextCursor.replay.lower_bound, tableScope);
+    assert.equal(nextCursor.scan_cursor, scanCursor);
 });
 
 test('rec manifest source disables replay in v2_primary cursor mode',
@@ -846,7 +938,7 @@ async () => {
     const nextCursor = readCursorState(batch.nextCursor);
 
     assert.equal(nextCursor.scan_cursor, scanCursor);
-    assert.equal(nextCursor.replay.lower_bound, replayLowerBound);
+    assert.equal(nextCursor.replay.lower_bound, prefix);
     assert.equal(nextCursor.replay.last_replay_at, null);
 });
 
@@ -1013,7 +1105,7 @@ test('rec manifest source enforces replay page/key caps', async () => {
     );
     assert.equal(client.listCalls.length, 2);
     assert.equal(client.listCalls[0]?.startAfter, scanCursor);
-    assert.equal(client.listCalls[1]?.startAfter, replayLowerBound);
+    assert.equal(client.listCalls[1]?.startAfter, prefix);
 });
 
 test('rec manifest source merges fast and replay keys deterministically',
