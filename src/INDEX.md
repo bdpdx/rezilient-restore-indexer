@@ -17,7 +17,8 @@
   fail-closed source configuration and source cursor mode wiring.
 - `store.ts`: sidecar persistence interface plus in-memory/Postgres durable
   implementations aligned to restore-plane relational tables including
-  `source_progress` checkpoints and source-scope leader leases.
+  `source_progress` checkpoints, source-scope leader leases, and scoped
+  indexed-event PIT candidate lookup.
 - `freshness.ts`: freshness/executability state evaluation.
 - `indexer.service.ts`: indexing core with generation-bound watermark logic.
 - `worker.ts`: cursor-aware source polling loop with continuous runtime

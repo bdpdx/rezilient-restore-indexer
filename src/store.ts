@@ -5,6 +5,9 @@ import {
 } from '@rezilient/types';
 import type {
     BackfillRunState,
+    IndexedEventLookupCandidate,
+    IndexedEventLookupInput,
+    IndexedEventLookupResult,
     IndexedEventRecord,
     PartitionScope,
     PartitionWatermarkState,
@@ -297,6 +300,88 @@ function recomputeCoverageFromWatermarks(
     };
 }
 
+type NormalizedIndexedEventLookupInput = {
+    instanceId: string;
+    pitCutoff: string;
+    recordSysIds: string[];
+    source: string;
+    tables: string[];
+    tenantId: string;
+};
+
+function canonicalizeLookupTimestamp(
+    value: string,
+    field: string,
+): string {
+    try {
+        return canonicalizeIsoDateTimeWithMillis(String(value));
+    } catch {
+        throw new Error(`invalid ${field} timestamp`);
+    }
+}
+
+function normalizeLookupList(
+    values: string[],
+    field: string,
+): string[] {
+    if (!Array.isArray(values)) {
+        throw new Error(`${field} must contain at least one value`);
+    }
+
+    const unique = new Set<string>();
+
+    for (const value of values) {
+        const normalized = String(value || '').trim();
+
+        if (!normalized) {
+            continue;
+        }
+
+        unique.add(normalized);
+    }
+
+    if (unique.size === 0) {
+        throw new Error(`${field} must contain at least one value`);
+    }
+
+    return Array.from(unique.values()).sort((left, right) => {
+        return left.localeCompare(right);
+    });
+}
+
+function normalizeIndexedEventLookupInput(
+    input: IndexedEventLookupInput,
+): NormalizedIndexedEventLookupInput {
+    return {
+        instanceId: readRequiredRuntimeText(
+            input.instanceId,
+            'indexed-event lookup instanceId',
+        ),
+        pitCutoff: canonicalizeLookupTimestamp(
+            input.pitCutoff,
+            'indexed-event lookup pitCutoff',
+        ),
+        recordSysIds: Array.isArray(input.recordSysIds)
+            ? normalizeLookupList(
+                input.recordSysIds,
+                'indexed-event lookup recordSysIds',
+            )
+            : [],
+        source: readRequiredRuntimeText(
+            input.source,
+            'indexed-event lookup source',
+        ),
+        tables: normalizeLookupList(
+            input.tables,
+            'indexed-event lookup tables',
+        ),
+        tenantId: readRequiredRuntimeText(
+            input.tenantId,
+            'indexed-event lookup tenantId',
+        ),
+    };
+}
+
 export interface RestoreIndexStore {
     acquireSourceLeaderLease(
         input: SourceLeaderLeaseAcquireInput,
@@ -306,6 +391,9 @@ export interface RestoreIndexStore {
     getPartitionWatermark(
         scope: PartitionScope,
     ): Promise<PartitionWatermarkState | null>;
+    lookupIndexedEventCandidates(
+        input: IndexedEventLookupInput,
+    ): Promise<IndexedEventLookupResult>;
     getSourceCoverage(
         tenantId: string,
         instanceId: string,
@@ -422,6 +510,54 @@ export class InMemoryRestoreIndexStore implements RestoreIndexStore {
         this.indexedEvents.set(key, cloneState(record));
 
         return 'inserted';
+    }
+
+    async lookupIndexedEventCandidates(
+        input: IndexedEventLookupInput,
+    ): Promise<IndexedEventLookupResult> {
+        const normalized = normalizeIndexedEventLookupInput(input);
+        const tableSet = new Set(normalized.tables);
+        const recordSysIdSet = normalized.recordSysIds.length > 0
+            ? new Set(normalized.recordSysIds)
+            : null;
+        const pitCutoffMillis = parseIsoUtcMillis(normalized.pitCutoff);
+        const candidates: IndexedEventLookupCandidate[] = [];
+
+        for (const record of this.indexedEvents.values()) {
+            if (record.tenantId !== normalized.tenantId) {
+                continue;
+            }
+
+            if (record.partitionScope.instanceId !== normalized.instanceId) {
+                continue;
+            }
+
+            if (record.partitionScope.source !== normalized.source) {
+                continue;
+            }
+
+            const candidate = buildLookupCandidateFromIndexedEvent(record);
+
+            if (candidate === null) {
+                continue;
+            }
+
+            if (!tableSet.has(candidate.table)) {
+                continue;
+            }
+
+            if (recordSysIdSet && !recordSysIdSet.has(candidate.recordSysId)) {
+                continue;
+            }
+
+            if (parseIsoUtcMillis(candidate.eventTime) > pitCutoffMillis) {
+                continue;
+            }
+
+            candidates.push(candidate);
+        }
+
+        return buildIndexedEventLookupResult(candidates);
     }
 
     async getPartitionWatermark(
@@ -564,6 +700,20 @@ type PartitionWatermarkRow = {
     measured_at: Date | string;
     source: string;
     tenant_id: string;
+    topic: string;
+};
+
+type IndexedEventLookupRow = {
+    artifact_key: string | null;
+    event_id: string | null;
+    event_time: Date | string;
+    kafka_offset: number | string;
+    kafka_partition: number;
+    manifest_key: string | null;
+    record_sys_id: string | null;
+    sys_mod_count: number | null;
+    sys_updated_on: string | null;
+    table_name: string | null;
     topic: string;
 };
 
@@ -756,6 +906,196 @@ function sanitizeOperation(
     }
 
     return null;
+}
+
+function toOptionalNonNegativeInteger(
+    value: unknown,
+): number | null {
+    if (value === null || value === undefined) {
+        return null;
+    }
+
+    const parsed = Number(value);
+
+    if (!Number.isInteger(parsed) || parsed < 0) {
+        return null;
+    }
+
+    return parsed;
+}
+
+function parseServiceNowUtcMillis(
+    value: string | null,
+): number {
+    if (value === null) {
+        return Number.NEGATIVE_INFINITY;
+    }
+
+    const parsed = Date.parse(
+        value.replace(' ', 'T') + '.000Z',
+    );
+
+    if (!Number.isFinite(parsed)) {
+        return Number.NEGATIVE_INFINITY;
+    }
+
+    return parsed;
+}
+
+function parseIsoUtcMillis(
+    value: string,
+): number {
+    const parsed = Date.parse(value);
+
+    if (!Number.isFinite(parsed)) {
+        return Number.NEGATIVE_INFINITY;
+    }
+
+    return parsed;
+}
+
+function parseOffsetBigInt(
+    value: string,
+): bigint {
+    try {
+        return BigInt(canonicalizeRestoreOffsetDecimalString(value));
+    } catch {
+        return BigInt(0);
+    }
+}
+
+function compareLookupCandidates(
+    left: IndexedEventLookupCandidate,
+    right: IndexedEventLookupCandidate,
+): number {
+    const tableCompare = left.table.localeCompare(right.table);
+
+    if (tableCompare !== 0) {
+        return tableCompare;
+    }
+
+    const recordCompare = left.recordSysId.localeCompare(right.recordSysId);
+
+    if (recordCompare !== 0) {
+        return recordCompare;
+    }
+
+    const sysUpdatedCompare = parseServiceNowUtcMillis(right.sysUpdatedOn)
+        - parseServiceNowUtcMillis(left.sysUpdatedOn);
+
+    if (sysUpdatedCompare !== 0) {
+        return sysUpdatedCompare;
+    }
+
+    const leftSysModCount = left.sysModCount === null
+        ? Number.NEGATIVE_INFINITY
+        : left.sysModCount;
+    const rightSysModCount = right.sysModCount === null
+        ? Number.NEGATIVE_INFINITY
+        : right.sysModCount;
+    const sysModCompare = rightSysModCount - leftSysModCount;
+
+    if (sysModCompare !== 0) {
+        return sysModCompare;
+    }
+
+    const eventTimeCompare = parseIsoUtcMillis(right.eventTime)
+        - parseIsoUtcMillis(left.eventTime);
+
+    if (eventTimeCompare !== 0) {
+        return eventTimeCompare;
+    }
+
+    const eventIdCompare = right.eventId.localeCompare(left.eventId);
+
+    if (eventIdCompare !== 0) {
+        return eventIdCompare;
+    }
+
+    const topicCompare = left.topic.localeCompare(right.topic);
+
+    if (topicCompare !== 0) {
+        return topicCompare;
+    }
+
+    if (left.partition !== right.partition) {
+        return left.partition - right.partition;
+    }
+
+    const leftOffset = parseOffsetBigInt(left.offset);
+    const rightOffset = parseOffsetBigInt(right.offset);
+
+    if (leftOffset !== rightOffset) {
+        return rightOffset > leftOffset ? 1 : -1;
+    }
+
+    const artifactCompare = left.artifactKey.localeCompare(right.artifactKey);
+
+    if (artifactCompare !== 0) {
+        return artifactCompare;
+    }
+
+    return left.manifestKey.localeCompare(right.manifestKey);
+}
+
+function buildIndexedEventLookupResult(
+    candidates: IndexedEventLookupCandidate[],
+): IndexedEventLookupResult {
+    const ordered = [...candidates].sort(compareLookupCandidates);
+
+    return {
+        candidates: ordered,
+        coverage: ordered.length > 0 ? 'covered' : 'no_indexed_coverage',
+    };
+}
+
+function buildLookupCandidateFromIndexedEvent(
+    record: IndexedEventRecord,
+): IndexedEventLookupCandidate | null {
+    const table = readOptionalString(record.table)
+        || readOptionalString(record.metadata.table);
+    const recordSysId = readOptionalString(record.metadata.record_sys_id);
+    const eventId = readOptionalString(record.metadata.event_id)
+        || record.artifactKey;
+    const eventTimeInput = readOptionalString(record.metadata.__time)
+        || record.indexedAt;
+    const kafkaOffsetRaw = record.metadata.offset;
+    const metadataRecord = record.metadata as Record<string, unknown>;
+    const manifestKey =
+        readOptionalString(metadataRecord.manifest_key)
+        || readOptionalString(metadataRecord.manifestKey)
+        || record.artifactKey.replace(/\.artifact\.json$/u, '.manifest.json');
+
+    if (!table || !recordSysId) {
+        return null;
+    }
+
+    if (typeof kafkaOffsetRaw !== 'string' && typeof kafkaOffsetRaw !== 'number') {
+        return null;
+    }
+
+    return {
+        artifactKey: record.artifactKey,
+        eventId,
+        eventTime: canonicalizeLookupTimestamp(
+            eventTimeInput,
+            'indexed-event lookup event_time',
+        ),
+        manifestKey,
+        offset: canonicalizeRestoreOffsetDecimalString(kafkaOffsetRaw),
+        partition: parseNonNegativeInteger(
+            record.partitionScope.partition,
+            'indexed-event lookup partition',
+        ),
+        recordSysId,
+        sysModCount: toOptionalNonNegativeInteger(record.metadata.sys_mod_count),
+        sysUpdatedOn: readOptionalString(record.metadata.sys_updated_on),
+        table,
+        topic: readRequiredRuntimeText(
+            record.partitionScope.topic,
+            'indexed-event lookup topic',
+        ),
+    };
 }
 
 function validateSqlIdentifier(
@@ -1059,6 +1399,110 @@ export class PostgresRestoreIndexStore implements RestoreIndexStore {
         }
 
         return 'existing';
+    }
+
+    async lookupIndexedEventCandidates(
+        input: IndexedEventLookupInput,
+    ): Promise<IndexedEventLookupResult> {
+        await this.ensureReady();
+
+        const normalized = normalizeIndexedEventLookupInput(input);
+        const params: Array<string | string[]> = [
+            normalized.tenantId,
+            normalized.instanceId,
+            normalized.source,
+            normalized.pitCutoff,
+            normalized.tables,
+        ];
+        let recordSysIdClause = '';
+
+        if (normalized.recordSysIds.length > 0) {
+            const recordSysIdParam = params.length + 1;
+            params.push(normalized.recordSysIds);
+            recordSysIdClause =
+                `AND record_sys_id = ANY($${recordSysIdParam}::text[])`;
+        }
+
+        const result = await this.pool.query<IndexedEventLookupRow>(
+            `SELECT
+                table_name,
+                record_sys_id,
+                event_id,
+                sys_updated_on,
+                sys_mod_count,
+                event_time,
+                topic,
+                kafka_partition,
+                kafka_offset,
+                artifact_key,
+                manifest_key
+            FROM ${this.indexEventsTableQualified}
+            WHERE tenant_id = $1
+              AND instance_id = $2
+              AND source = $3
+              AND event_time <= $4::timestamptz
+              AND table_name = ANY($5::text[])
+              AND table_name IS NOT NULL
+              AND record_sys_id IS NOT NULL
+              ${recordSysIdClause}
+            ORDER BY
+                table_name ASC,
+                record_sys_id ASC,
+                sys_updated_on DESC NULLS LAST,
+                sys_mod_count DESC NULLS LAST,
+                event_time DESC,
+                event_id DESC,
+                topic ASC,
+                kafka_partition ASC,
+                kafka_offset::numeric DESC,
+                artifact_key ASC,
+                manifest_key ASC`,
+            params,
+        );
+        const candidates: IndexedEventLookupCandidate[] = [];
+
+        for (const row of result.rows) {
+            const table = readOptionalString(row.table_name);
+            const recordSysId = readOptionalString(row.record_sys_id);
+            const eventId = readOptionalString(row.event_id);
+            const artifactKey = readOptionalString(row.artifact_key);
+            const manifestKey = readOptionalString(row.manifest_key);
+
+            if (
+                !table
+                || !recordSysId
+                || !eventId
+                || !artifactKey
+                || !manifestKey
+            ) {
+                continue;
+            }
+
+            candidates.push({
+                artifactKey,
+                eventId,
+                eventTime: canonicalizeTimestamp(
+                    row.event_time,
+                    'indexed-event lookup event_time',
+                ),
+                manifestKey,
+                offset: canonicalizeRestoreOffsetDecimalString(row.kafka_offset),
+                partition: parseNonNegativeInteger(
+                    row.kafka_partition,
+                    'indexed-event lookup kafka_partition',
+                ),
+                recordSysId,
+                sysModCount: toOptionalNonNegativeInteger(row.sys_mod_count),
+                sysUpdatedOn: readOptionalString(row.sys_updated_on),
+                table,
+                topic: readRequiredRuntimeText(
+                    row.topic,
+                    'indexed-event lookup topic',
+                ),
+            });
+        }
+
+        return buildIndexedEventLookupResult(candidates);
     }
 
     async getPartitionWatermark(

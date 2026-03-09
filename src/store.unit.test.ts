@@ -108,6 +108,50 @@ function buildBackfillRun(
     };
 }
 
+function buildLookupRecord(input: {
+    artifactKey?: string;
+    eventId: string;
+    eventTime: string;
+    offset: string;
+    partition?: number;
+    recordSysId: string;
+    source?: string;
+    sysModCount?: number;
+    sysUpdatedOn?: string;
+    table: string;
+    topic?: string;
+}): IndexedEventRecord {
+    const topic = input.topic || 'rez.cdc';
+    const partition = input.partition ?? 0;
+    const source = input.source || 'sn://acme-dev.service-now.com';
+    const artifactKey = input.artifactKey
+        || `rez/restore/event=${input.eventId}.artifact.json`;
+
+    return buildRecord({
+        artifactKey,
+        metadata: {
+            ...buildRecord().metadata,
+            __time: input.eventTime,
+            event_id: input.eventId,
+            offset: input.offset,
+            partition,
+            record_sys_id: input.recordSysId,
+            source,
+            sys_mod_count: input.sysModCount ?? 1,
+            sys_updated_on: input.sysUpdatedOn ?? '2026-02-16 12:00:00',
+            table: input.table,
+            topic,
+        },
+        partitionScope: {
+            ...buildRecord().partitionScope,
+            partition,
+            source,
+            topic,
+        },
+        table: input.table,
+    });
+}
+
 describe('InMemoryRestoreIndexStore', () => {
     it('upsertIndexedEvent returns inserted for new event',
     async () => {
@@ -152,6 +196,122 @@ describe('InMemoryRestoreIndexStore', () => {
             },
         }));
         assert.equal(store.getIndexedEventCount(), 2);
+    });
+
+    it('lookupIndexedEventCandidates filters by scope and record ids',
+    async () => {
+        const store = new InMemoryRestoreIndexStore();
+        await store.upsertIndexedEvent(buildLookupRecord({
+            eventId: 'evt-scope-1',
+            eventTime: '2026-02-16T12:00:00.000Z',
+            offset: '10',
+            recordSysId: 'record-001',
+            table: 'x_app.ticket',
+        }));
+        await store.upsertIndexedEvent(buildLookupRecord({
+            eventId: 'evt-scope-2',
+            eventTime: '2026-02-16T12:00:00.000Z',
+            offset: '11',
+            recordSysId: 'record-001',
+            table: 'x_app.incident',
+        }));
+        await store.upsertIndexedEvent(buildLookupRecord({
+            eventId: 'evt-scope-3',
+            eventTime: '2026-02-16T12:00:00.000Z',
+            offset: '12',
+            recordSysId: 'record-001',
+            source: 'sn://other.service-now.com',
+            table: 'x_app.ticket',
+        }));
+
+        const result = await store.lookupIndexedEventCandidates({
+            instanceId: 'sn-dev-01',
+            pitCutoff: '2026-02-16T12:30:00.000Z',
+            recordSysIds: ['record-001'],
+            source: 'sn://acme-dev.service-now.com',
+            tables: ['x_app.ticket'],
+            tenantId: 'tenant-acme',
+        });
+
+        assert.equal(result.coverage, 'covered');
+        assert.equal(result.candidates.length, 1);
+        assert.equal(result.candidates[0].eventId, 'evt-scope-1');
+        assert.equal(result.candidates[0].table, 'x_app.ticket');
+        assert.equal(result.candidates[0].recordSysId, 'record-001');
+    });
+
+    it('lookupIndexedEventCandidates applies PIT cutoff and stable ordering',
+    async () => {
+        const store = new InMemoryRestoreIndexStore();
+        await store.upsertIndexedEvent(buildLookupRecord({
+            eventId: 'evt-order-a1',
+            eventTime: '2026-02-16T11:00:00.000Z',
+            offset: '21',
+            recordSysId: 'alpha',
+            sysModCount: 1,
+            sysUpdatedOn: '2026-02-16 11:00:00',
+            table: 'x_app.ticket',
+        }));
+        await store.upsertIndexedEvent(buildLookupRecord({
+            eventId: 'evt-order-a2',
+            eventTime: '2026-02-16T11:00:00.000Z',
+            offset: '22',
+            recordSysId: 'alpha',
+            sysModCount: 2,
+            sysUpdatedOn: '2026-02-16 11:00:00',
+            table: 'x_app.ticket',
+        }));
+        await store.upsertIndexedEvent(buildLookupRecord({
+            eventId: 'evt-order-b1',
+            eventTime: '2026-02-16T12:00:00.000Z',
+            offset: '23',
+            recordSysId: 'bravo',
+            sysModCount: 1,
+            sysUpdatedOn: '2026-02-16 12:00:00',
+            table: 'x_app.ticket',
+        }));
+        await store.upsertIndexedEvent(buildLookupRecord({
+            eventId: 'evt-order-a3-after-cutoff',
+            eventTime: '2026-02-16T13:00:00.000Z',
+            offset: '24',
+            recordSysId: 'alpha',
+            sysModCount: 3,
+            sysUpdatedOn: '2026-02-16 13:00:00',
+            table: 'x_app.ticket',
+        }));
+
+        const result = await store.lookupIndexedEventCandidates({
+            instanceId: 'sn-dev-01',
+            pitCutoff: '2026-02-16T12:30:00.000Z',
+            source: 'sn://acme-dev.service-now.com',
+            tables: ['x_app.ticket'],
+            tenantId: 'tenant-acme',
+        });
+
+        assert.equal(result.coverage, 'covered');
+        assert.deepEqual(
+            result.candidates.map((candidate) => candidate.eventId),
+            [
+                'evt-order-a2',
+                'evt-order-a1',
+                'evt-order-b1',
+            ],
+        );
+    });
+
+    it('lookupIndexedEventCandidates returns no_indexed_coverage when empty',
+    async () => {
+        const store = new InMemoryRestoreIndexStore();
+        const result = await store.lookupIndexedEventCandidates({
+            instanceId: 'sn-dev-01',
+            pitCutoff: '2026-02-16T12:30:00.000Z',
+            source: 'sn://acme-dev.service-now.com',
+            tables: ['x_app.ticket'],
+            tenantId: 'tenant-acme',
+        });
+
+        assert.equal(result.coverage, 'no_indexed_coverage');
+        assert.equal(result.candidates.length, 0);
     });
 
     it('getPartitionWatermark returns null for unknown partition',
@@ -728,5 +888,96 @@ describe('store helper functions (tested via PostgresRestoreIndexStore)', () => 
             () => new PostgresRestoreIndexStore(''),
             /REZ_RESTORE_PG_URL is required/,
         );
+    });
+
+    it('postgres lookupIndexedEventCandidates enforces PIT and ordering',
+    async () => {
+        const db = newDb();
+        const pgAdapter = db.adapters.createPg();
+        const pool = new pgAdapter.Pool();
+        const store = new PostgresRestoreIndexStore(
+            'postgres://unused',
+            {
+                pool: pool as any,
+            },
+        );
+
+        try {
+            await store.upsertIndexedEvent(buildLookupRecord({
+                eventId: 'evt-pg-a1',
+                eventTime: '2026-02-16T11:00:00.000Z',
+                offset: '31',
+                recordSysId: 'alpha',
+                sysModCount: 1,
+                sysUpdatedOn: '2026-02-16 11:00:00',
+                table: 'x_app.ticket',
+            }));
+            await store.upsertIndexedEvent(buildLookupRecord({
+                eventId: 'evt-pg-a2',
+                eventTime: '2026-02-16T11:00:00.000Z',
+                offset: '32',
+                recordSysId: 'alpha',
+                sysModCount: 2,
+                sysUpdatedOn: '2026-02-16 11:00:00',
+                table: 'x_app.ticket',
+            }));
+            await store.upsertIndexedEvent(buildLookupRecord({
+                eventId: 'evt-pg-a3-after-cutoff',
+                eventTime: '2026-02-16T13:00:00.000Z',
+                offset: '33',
+                recordSysId: 'alpha',
+                sysModCount: 3,
+                sysUpdatedOn: '2026-02-16 13:00:00',
+                table: 'x_app.ticket',
+            }));
+            await store.upsertIndexedEvent(buildLookupRecord({
+                eventId: 'evt-pg-b1',
+                eventTime: '2026-02-16T12:00:00.000Z',
+                offset: '34',
+                recordSysId: 'bravo',
+                sysModCount: 1,
+                sysUpdatedOn: '2026-02-16 12:00:00',
+                table: 'x_app.ticket',
+            }));
+            await store.upsertIndexedEvent(buildLookupRecord({
+                eventId: 'evt-pg-other-table',
+                eventTime: '2026-02-16T12:00:00.000Z',
+                offset: '35',
+                recordSysId: 'alpha',
+                table: 'x_app.incident',
+            }));
+
+            const result = await store.lookupIndexedEventCandidates({
+                instanceId: 'sn-dev-01',
+                pitCutoff: '2026-02-16T12:30:00.000Z',
+                source: 'sn://acme-dev.service-now.com',
+                tables: ['x_app.ticket'],
+                tenantId: 'tenant-acme',
+            });
+
+            assert.equal(result.coverage, 'covered');
+            assert.deepEqual(
+                result.candidates.map((candidate) => candidate.eventId),
+                [
+                    'evt-pg-a2',
+                    'evt-pg-a1',
+                    'evt-pg-b1',
+                ],
+            );
+
+            const noCoverage = await store.lookupIndexedEventCandidates({
+                instanceId: 'sn-dev-01',
+                pitCutoff: '2026-02-16T12:30:00.000Z',
+                source: 'sn://acme-dev.service-now.com',
+                tables: ['x_app.unknown'],
+                tenantId: 'tenant-acme',
+            });
+
+            assert.equal(noCoverage.coverage, 'no_indexed_coverage');
+            assert.equal(noCoverage.candidates.length, 0);
+        } finally {
+            await store.close();
+            await pool.end();
+        }
     });
 });

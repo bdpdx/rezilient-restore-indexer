@@ -117,6 +117,34 @@ export type SourceProgressState = {
     updatedAt: string;
 };
 
+export type IndexedEventLookupInput = {
+    instanceId: string;
+    pitCutoff: string;
+    recordSysIds?: string[];
+    source: string;
+    tables: string[];
+    tenantId: string;
+};
+
+export type IndexedEventLookupCandidate = {
+    artifactKey: string;
+    eventId: string;
+    eventTime: string;
+    manifestKey: string;
+    offset: string;
+    partition: number;
+    recordSysId: string;
+    sysModCount: number | null;
+    sysUpdatedOn: string | null;
+    table: string;
+    topic: string;
+};
+
+export type IndexedEventLookupResult = {
+    candidates: IndexedEventLookupCandidate[];
+    coverage: 'covered' | 'no_indexed_coverage';
+};
+
 export type FreshnessEvaluation = {
     executability: RestoreWatermarkExecutability;
     freshness: RestoreWatermarkFreshness;

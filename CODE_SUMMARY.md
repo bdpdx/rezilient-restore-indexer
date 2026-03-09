@@ -16,7 +16,7 @@ Entrypoints:
   Postgres-backed durable state stores for restore-plane tables
   (`index_events`, `partition_watermarks`, `partition_generations`,
   `source_coverage`, `backfill_runs`, `source_progress`,
-  `source_leader_leases`).
+  `source_leader_leases`) including scoped indexed-event PIT candidate lookup.
 - `src/worker.ts`: cursor-aware batch worker with continuous polling loop,
   fail-closed cursor advancement, v2 shard (`topic|partition`) progression
   tracking, source-scope leader lease gating, persisted source progress
