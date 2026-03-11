@@ -1233,7 +1233,7 @@ async () => {
     assert.equal(nextCursor.scan_cursor, fastManifest120);
 });
 
-test('rec manifest source upgrades legacy cursor to v3 payload', async () => {
+test('rec manifest source fails closed on legacy plain-string cursor', async () => {
     const legacyCursor = 'rez/restore-artifacts/legacy-scan.manifest.json';
     const source = new RecManifestArtifactBatchSource(
         new ScriptedObjectStoreClient([], new Map()),
@@ -1243,14 +1243,12 @@ test('rec manifest source upgrades legacy cursor to v3 payload', async () => {
             tenantId: 'tenant-acme',
         },
     );
-    const batch = await source.readBatch({
-        cursor: legacyCursor,
-        limit: 1,
-    });
-    const nextCursor = readCursorState(batch.nextCursor);
-
-    assert.equal(nextCursor.scan_cursor, legacyCursor);
-    assert.equal(nextCursor.replay.enabled, false);
+    await assert.rejects(async () => {
+        await source.readBatch({
+            cursor: legacyCursor,
+            limit: 1,
+        });
+    }, /legacy plain-string cursors are not supported/);
 });
 
 test('rec manifest source fails closed on malformed JSON cursor with diagnostics',

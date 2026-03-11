@@ -117,7 +117,13 @@ export class BackfillController {
             mode: this.mode,
         });
 
-        if (batch.realtimeLagSeconds > this.state.maxRealtimeLagSeconds) {
+        const lagSeconds = batch.realtimeLagSeconds;
+
+        if (
+            lagSeconds === null
+            || !Number.isFinite(lagSeconds)
+            || lagSeconds > this.state.maxRealtimeLagSeconds
+        ) {
             this.state = {
                 ...this.state,
                 reasonCode: 'paused_realtime_lag_guardrail',
@@ -191,7 +197,7 @@ export class InMemoryBackfillBatchSource implements BackfillBatchSource {
 
     constructor(
         private readonly items: IndexArtifactInput[],
-        private readonly realtimeLagSeconds: number,
+        private readonly realtimeLagSeconds: number | null,
     ) {}
 
     async readBatch(input: {

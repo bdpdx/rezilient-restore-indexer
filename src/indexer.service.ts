@@ -467,6 +467,12 @@ export class RestoreIndexerService {
                 );
 
                 await this.store.putPartitionWatermark(freshWatermark);
+                await this.store.recomputeSourceCoverage({
+                    instanceId: normalized.partitionScope.instanceId,
+                    measuredAt,
+                    source: normalized.partitionScope.source,
+                    tenantId: normalized.partitionScope.tenantId,
+                });
 
                 return {
                     eventWriteState,

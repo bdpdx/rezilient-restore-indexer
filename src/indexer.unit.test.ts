@@ -4,6 +4,7 @@ import {
     RestoreIndexerService,
     type SourceProgressUpdateInput,
 } from './indexer.service.js';
+import { normalizeOperationalMetadata } from './metadata.js';
 import { InMemoryRestoreIndexStore } from './store.js';
 import { buildTestInput } from './test-helpers.js';
 
@@ -383,6 +384,59 @@ describe('buildNextWatermark (tested via indexArtifact)', () => {
         assert.equal(
             result.watermark.indexedThroughOffset,
             '10',
+        );
+    });
+
+    it('duplicate first-event watermark initialization refreshes source coverage',
+    async () => {
+        const { indexer, store } = createIndexer();
+        const input = buildTestInput({
+            eventId: 'evt-dup-first',
+            eventTime: '2026-02-16T13:00:00.000Z',
+            generationId: 'gen-dup-first',
+            indexedAt: '2026-02-16T13:05:00.000Z',
+            offset: 21,
+            partition: 4,
+        });
+        const normalized = normalizeOperationalMetadata(input);
+
+        await store.upsertIndexedEvent({
+            artifactKey: input.manifest.artifact_key,
+            artifactKind: input.manifest.artifact_kind,
+            app: input.manifest.app,
+            generationId: input.generationId,
+            indexedAt: input.indexedAt || '2026-02-16T13:05:00.000Z',
+            ingestionMode: input.ingestionMode,
+            instanceId: input.manifest.instance_id,
+            manifestVersion: input.manifest.manifest_version,
+            metadata: normalized.metadata,
+            objectKeyLayoutVersion: input.manifest.object_key_layout_version,
+            partitionScope: normalized.partitionScope,
+            table: input.manifest.table,
+            tenantId: input.tenantId,
+        });
+
+        const result = await indexer.indexArtifact(input);
+        const coverage = await indexer.getSourceCoverageWindow(
+            input.tenantId,
+            input.manifest.instance_id,
+            input.manifest.source,
+        );
+
+        assert.equal(result.eventWriteState, 'existing');
+        assert.equal(result.watermark.indexedThroughOffset, '21');
+        assert.notEqual(coverage, null);
+        assert.equal(
+            coverage?.earliest_indexed_time,
+            '2026-02-16T13:00:00.000Z',
+        );
+        assert.equal(
+            coverage?.latest_indexed_time,
+            '2026-02-16T13:00:00.000Z',
+        );
+        assert.equal(
+            coverage?.measured_at,
+            '2026-02-16T13:05:00.000Z',
         );
     });
 });

@@ -46,76 +46,25 @@ describe('source-cursor', () => {
         );
     });
 
-    it('accepts legacy plain-string cursor and upgrades to v3', () => {
+    it('rejects legacy plain-string cursors', () => {
         const legacyCursor =
             'rez/restore-artifacts/tenant/x/table/y/late.manifest.json';
-        const replayDefaults: SourceCursorReplayDefaults = {
-            enabled: false,
-            lowerBound: 'rez/restore-artifacts/tenant',
-        };
-        const parsed = parseSourceCursorState(
-            legacyCursor,
-            replayDefaults,
-        );
 
-        assert.deepEqual(parsed, {
-            legacy: {
-                replay: {
-                    enabled: false,
-                    last_replay_at: null,
-                    lower_bound: 'rez/restore-artifacts/tenant',
-                },
-                scan_cursor: legacyCursor,
-            },
-            replay: {
-                enabled: false,
-                last_replay_at: null,
-                lower_bound: 'rez/restore-artifacts/tenant',
-            },
-            scan_cursor: legacyCursor,
-            v2: {
-                by_shard: {},
-                last_reconcile_at: null,
-            },
-            v: SOURCE_CURSOR_VERSION,
-        });
-        assert.equal(
-            serializeSourceCursorState(parsed),
-            '{"legacy":{"replay":{"enabled":false,"last_replay_at":null,'
-                + '"lower_bound":"rez/restore-artifacts/tenant"},'
-                + '"scan_cursor":"rez/restore-artifacts/tenant/x/table/y/'
-                + 'late.manifest.json"},"v2":{"by_shard":{},'
-                + '"last_reconcile_at":null},"v":3}',
+        assert.throws(
+            () => parseSourceCursorState(legacyCursor, DEFAULT_REPLAY),
+            /legacy plain-string cursors are not supported/,
         );
     });
 
-    it('parses existing v2 payload and preserves replay state', () => {
+    it('rejects existing v2 payloads', () => {
         const v2 = '{"v":2,"scan_cursor":"scan-key","replay":{"enabled":true,'
             + '"lower_bound":"bound","last_replay_at":'
             + '"2026-02-28T12:00:00.000Z"}}';
-        const parsed = parseSourceCursorState(v2, DEFAULT_REPLAY);
 
-        assert.deepEqual(parsed, {
-            legacy: {
-                replay: {
-                    enabled: true,
-                    last_replay_at: '2026-02-28T12:00:00.000Z',
-                    lower_bound: 'bound',
-                },
-                scan_cursor: 'scan-key',
-            },
-            replay: {
-                enabled: true,
-                last_replay_at: '2026-02-28T12:00:00.000Z',
-                lower_bound: 'bound',
-            },
-            scan_cursor: 'scan-key',
-            v2: {
-                by_shard: {},
-                last_reconcile_at: null,
-            },
-            v: SOURCE_CURSOR_VERSION,
-        });
+        assert.throws(
+            () => parseSourceCursorState(v2, DEFAULT_REPLAY),
+            /source cursor version must be 3/,
+        );
     });
 
     it('parses existing v3 payload with v2 shard progress', () => {
@@ -164,13 +113,13 @@ describe('source-cursor', () => {
         );
     });
 
-    it('rejects unsupported v2 versions', () => {
+    it('rejects unsupported cursor versions', () => {
         const wrongVersion = '{"v":1,"scan_cursor":"scan-key","replay":'
             + '{"enabled":true,"lower_bound":null,'
             + '"last_replay_at":null}}';
         assert.throws(
             () => parseSourceCursorState(wrongVersion, DEFAULT_REPLAY),
-            /version must be 2 or 3/,
+            /version must be 3/,
         );
     });
 });

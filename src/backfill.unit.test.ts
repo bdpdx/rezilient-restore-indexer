@@ -12,7 +12,7 @@ import type { BackfillMode, IndexArtifactInput } from './types.js';
 
 function createFixture(overrides?: {
     items?: IndexArtifactInput[];
-    lagSeconds?: number;
+    lagSeconds?: number | null;
     maxLag?: number;
     mode?: BackfillMode;
     runId?: string;
@@ -31,7 +31,9 @@ function createFixture(overrides?: {
         buildTestInput({ eventId: 'evt-bf-2', offset: 2 }),
         buildTestInput({ eventId: 'evt-bf-3', offset: 3 }),
     ];
-    const lagSeconds = overrides?.lagSeconds ?? 0;
+    const lagSeconds = overrides?.lagSeconds === undefined
+        ? 0
+        : overrides.lagSeconds;
     const source = new InMemoryBackfillBatchSource(
         items,
         lagSeconds,
@@ -253,6 +255,23 @@ describe('BackfillController', () => {
             state.reasonCode,
             'paused_realtime_lag_guardrail',
         );
+    });
+
+    it('tick pauses fail-closed when realtime lag is unknown',
+    async () => {
+        const { controller, store } = createFixture({
+            lagSeconds: null,
+            maxLag: 100,
+        });
+        const state = await controller.tick();
+
+        assert.equal(state.status, 'paused');
+        assert.equal(
+            state.reasonCode,
+            'paused_realtime_lag_guardrail',
+        );
+        assert.equal(state.processedCount, 0);
+        assert.equal(store.getIndexedEventCount(), 0);
     });
 
     it('tick pauses with reason paused_indexing_failures',

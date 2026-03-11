@@ -23,3 +23,9 @@ Run local tests:
 ```bash
 NPM_CONFIG_CACHE=/tmp/rez-npm-cache npm test
 ```
+
+Run the real-Postgres duplicate-write integration check with an
+admin-capable local DSN:
+```bash
+RRI_TEST_PG_URL=postgres://brian@localhost:5434/rez_restore?sslmode=disable npm run test:pg-integration
+```

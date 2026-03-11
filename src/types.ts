@@ -180,5 +180,5 @@ export type BackfillBatch = {
     done: boolean;
     items: IndexArtifactInput[];
     nextCursor: string | null;
-    realtimeLagSeconds: number;
+    realtimeLagSeconds: number | null;
 };

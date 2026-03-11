@@ -955,7 +955,19 @@ async () => {
                     eventId: 'evt-worker-observability',
                     offset: 31,
                 })],
-                nextCursor: '1',
+                nextCursor: serializeSourceCursorState({
+                    replay: {
+                        enabled: false,
+                        last_replay_at: null,
+                        lower_bound: null,
+                    },
+                    scan_cursor: '1',
+                    v2: {
+                        by_shard: {},
+                        last_reconcile_at: null,
+                    },
+                    v: SOURCE_CURSOR_VERSION,
+                }),
                 realtimeLagSeconds: 9,
                 scanCounters: {
                     fastPathSelectedKeyCount: 2,

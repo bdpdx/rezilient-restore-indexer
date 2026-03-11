@@ -389,7 +389,19 @@ async () => {
         async readBatch() {
             return {
                 items: [v1Item, v2Item],
-                nextCursor: 'rez/restore-artifacts/next-fast-key',
+                nextCursor: serializeSourceCursorState({
+                    replay: {
+                        enabled: false,
+                        last_replay_at: null,
+                        lower_bound: null,
+                    },
+                    scan_cursor: 'rez/restore-artifacts/next-fast-key',
+                    v2: {
+                        by_shard: {},
+                        last_reconcile_at: null,
+                    },
+                    v: SOURCE_CURSOR_VERSION,
+                }),
                 realtimeLagSeconds: 12,
                 scanCounters: {
                     fastPathSelectedKeyCount: 2,

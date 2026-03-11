@@ -90,33 +90,6 @@ describe('PostgresRestoreIndexStore (pg-mem)', () => {
         }
     });
 
-    // Skipped: pg-mem does not fully support ON CONFLICT DO NOTHING
-    // deduplication. Covered by durability.integration.test.ts with
-    // real pg-mem + indexer flow and InMemory store unit tests.
-    it.skip('upsertIndexedEvent deduplicates on conflict',
-    async () => {
-        const db = newDb();
-        const fixture = createFixture(db);
-
-        try {
-            await fixture.indexer.indexArtifact(
-                buildTestInput({
-                    eventId: 'evt-dup',
-                    offset: 1,
-                }),
-            );
-            const dup = await fixture.indexer.indexArtifact(
-                buildTestInput({
-                    eventId: 'evt-dup',
-                    offset: 1,
-                }),
-            );
-            assert.equal(dup.eventWriteState, 'existing');
-        } finally {
-            await fixture.close();
-        }
-    });
-
     it('getPartitionWatermark returns null for unknown partition',
     async () => {
         const db = newDb();

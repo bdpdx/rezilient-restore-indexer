@@ -1,4 +1,3 @@
-const LEGACY_SOURCE_CURSOR_VERSION = 2 as const;
 export const SOURCE_CURSOR_VERSION = 3 as const;
 
 export type SourceCursorReplayDefaults = {
@@ -35,9 +34,6 @@ export type SourceCursorV3State = {
     v2: SourceCursorV2ProgressState;
     v: typeof SOURCE_CURSOR_VERSION;
 };
-
-// Compatibility alias retained while call sites migrate to explicit v3 naming.
-export type SourceCursorV2State = SourceCursorV3State;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
     return Boolean(value)
@@ -96,18 +92,6 @@ function readVersion(value: unknown): typeof SOURCE_CURSOR_VERSION {
     }
 
     return SOURCE_CURSOR_VERSION;
-}
-
-function readLegacyVersion(
-    value: unknown,
-): typeof LEGACY_SOURCE_CURSOR_VERSION {
-    if (value !== LEGACY_SOURCE_CURSOR_VERSION) {
-        throw new Error(
-            `source cursor version must be ${LEGACY_SOURCE_CURSOR_VERSION}`,
-        );
-    }
-
-    return LEGACY_SOURCE_CURSOR_VERSION;
 }
 
 function normalizeReplayDefaults(
@@ -304,18 +288,6 @@ export function createSourceCursorState(
     });
 }
 
-function parseLegacyJsonCursorState(
-    value: unknown,
-): SourceCursorLegacyState {
-    if (!isRecord(value)) {
-        throw new Error('source cursor payload must be an object');
-    }
-
-    readLegacyVersion(value.v);
-
-    return parseLegacyState(value, 'source cursor');
-}
-
 function parseV3SourceCursorState(
     value: unknown,
 ): SourceCursorV3State {
@@ -353,7 +325,10 @@ export function parseSourceCursorState(
     }
 
     if (!trimmedStart.startsWith('{')) {
-        return createSourceCursorState(cursor, replayDefaults);
+        throw new Error(
+            'invalid source cursor state: legacy plain-string cursors '
+            + 'are not supported',
+        );
     }
 
     try {
@@ -363,22 +338,12 @@ export function parseSourceCursorState(
             throw new Error('source cursor payload must be an object');
         }
 
-        if (parsed.v === LEGACY_SOURCE_CURSOR_VERSION) {
-            const legacy = parseLegacyJsonCursorState(parsed);
-
-            return buildSourceCursorV3State({
-                legacy,
-                v2: createEmptyV2ProgressState(),
-            });
-        }
-
         if (parsed.v === SOURCE_CURSOR_VERSION) {
             return parseV3SourceCursorState(parsed);
         }
 
         throw new Error(
-            'source cursor version must be '
-            + `${LEGACY_SOURCE_CURSOR_VERSION} or ${SOURCE_CURSOR_VERSION}`,
+            `source cursor version must be ${SOURCE_CURSOR_VERSION}`,
         );
     } catch (error) {
         if (error instanceof Error) {

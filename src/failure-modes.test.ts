@@ -123,6 +123,43 @@ async () => {
     assert.equal(store.getIndexedEventCount(), 0);
 });
 
+test('backfill controller auto-pauses fail-closed when realtime lag is unknown',
+async () => {
+    const store = new InMemoryRestoreIndexStore();
+    const indexer = new RestoreIndexerService(store, {
+        freshnessPolicy: {
+            staleAfterSeconds: 120,
+            timeoutSeconds: 60,
+        },
+    });
+    const source = new InMemoryBackfillBatchSource([
+        buildTestInput({
+            eventId: 'evt-backfill-null-lag-1',
+            ingestionMode: 'bootstrap',
+            offset: 1,
+        }),
+    ], null);
+    const backfill = new BackfillController(
+        'bootstrap',
+        source,
+        indexer,
+        store,
+        {
+            maxRealtimeLagSeconds: 180,
+            runId: 'run-backfill-null-lag-guard',
+            throttleBatchSize: 100,
+            timeProvider: () => '2026-02-16T12:20:00.000Z',
+        },
+    );
+
+    const state = await backfill.tick();
+
+    assert.equal(state.status, 'paused');
+    assert.equal(state.reasonCode, 'paused_realtime_lag_guardrail');
+    assert.equal(state.processedCount, 0);
+    assert.equal(store.getIndexedEventCount(), 0);
+});
+
 test('backfill controller pauses fail-closed on indexing failures', async () => {
     const store = new InMemoryRestoreIndexStore();
     const indexer = new RestoreIndexerService(store, {
